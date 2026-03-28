@@ -274,7 +274,7 @@ def readCamerasFromTransformsCity(
 
         frames = contents["frames"]
         # check if filename already contain postfix
-        if frames[0]["file_path"].split(".")[-1] in ["jpg", "jpeg", "JPG", "png"]:
+        if frames[0]["file_name"].split(".")[-1] in ["jpg", "jpeg", "JPG", "png"]:
             extension = ""
 
         c2ws = np.array([frame["transform_matrix"] for frame in frames])
@@ -286,8 +286,8 @@ def readCamerasFromTransformsCity(
         progress_bar = tqdm(frames, desc="Loading dataset")
 
         for idx, frame in enumerate(frames):
-            # cam_name = os.path.join(path, frame["file_path"] + extension)
-            cam_name = frame["file_path"]
+            cam_name = os.path.join(path, frame["file_name"] + extension)
+            # cam_name = frame["file_name"]
             if not os.path.exists(cam_name):
                 print(f"File {cam_name} not found, skipping...")
                 continue
