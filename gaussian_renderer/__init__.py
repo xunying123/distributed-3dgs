@@ -544,8 +544,12 @@ def all_to_all_communication_final(
     batched_screenspace_params,
     batched_cuda_args,
     batched_strategies,
+    iteration=0,
 ):
+    r = utils.DEFAULT_GROUP.rank()
+    ws = utils.DEFAULT_GROUP.size()
     num_cameras = len(batched_rasterizers)
+    log_file = utils.get_log_file()
     # gpui_to_gpuj_camk_size
     # gpui_to_gpuj_camk_send_ids
 
@@ -605,6 +609,10 @@ def all_to_all_communication_final(
                     device="cuda",
                 )
             )
+        send_bytes = sum(_nbytes(t) for t in tensor_to_rki)
+        recv_bytes = sum(_nbytes(t) for t in tensor_from_rki)
+        send_entries = sum(int(t.shape[0]) for t in tensor_to_rki)
+        recv_entries = sum(int(t.shape[0]) for t in tensor_from_rki)
 
         if (
             use_function_version
@@ -636,6 +644,8 @@ def all_to_all_communication_final(
                     dim=0,
                 ).contiguous()
             )
+        if (iteration - 1) % 250 == 0:
+            log_file.write(f"[iter {iteration}] send={send_bytes/1e6:.2f}MB recv={recv_bytes/1e6:.2f}MB "f"send_entries={send_entries} recv_entries={recv_entries} \n")
 
         return tensors_per_camera
 
@@ -656,6 +666,12 @@ def all_to_all_communication_final(
                 [radii.float().unsqueeze(1), depths.unsqueeze(1)], dim=1
             ).contiguous()
         )
+        
+    # if ((iteration - 1) % 500 == 0 and iteration > 20000):
+    #     external_recv = sum(gpui_to_gpuj_imgk_size[i][r][k] for i in range(ws) if i!=r for k in range(num_cameras))
+    #     external_send = sum(gpui_to_gpuj_imgk_size[r][j][k] for j in range(ws) if j!=r for k in range(num_cameras))
+    #     local_kept    = sum(gpui_to_gpuj_imgk_size[r][r][k] for k in range(num_cameras))
+    #     print(f"[iter {iteration}] [rank {r}] local_kept={local_kept} external_send={external_send} external_recv={external_recv}")
 
     batched_params_redistributed = one_all_to_all(
         batched_catted_screenspace_states, use_function_version=True
@@ -874,6 +890,8 @@ def gsplat_all_to_all_communication_final(
         gpui_to_gpuj_imgk_size,
     )
 
+def _nbytes(t): 
+    return int(t.numel() * t.element_size())
 
 def distributed_preprocess3dgs_and_all2all_final(
     batched_viewpoint_cameras,
@@ -882,6 +900,7 @@ def distributed_preprocess3dgs_and_all2all_final(
     bg_color: torch.Tensor,
     scaling_modifier=1.0,
     batched_strategies=None,
+    iteration=0,
     mode="train",
 ):
     """
@@ -1014,6 +1033,7 @@ def distributed_preprocess3dgs_and_all2all_final(
         batched_screenspace_params,
         batched_cuda_args,
         batched_strategies,
+        iteration=iteration,
     )
     utils.check_initial_gpu_memory_usage("after forward_all_to_all_communication")
     if timers is not None:
@@ -1176,7 +1196,6 @@ def gsplat_distributed_preprocess3dgs_and_all2all_final(
         batched_radiis,  # (B, N)
         batched_depths,  # (B, N)
     ]
-
     if timers is not None:
         timers.start("forward_all_to_all_communication")
     (

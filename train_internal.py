@@ -173,6 +173,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 pipe_args,
                 background,
                 batched_strategies=batched_strategies,
+                iteration = iteration,
                 mode="train",
             )
             batched_image, batched_compute_locally = render_final(
