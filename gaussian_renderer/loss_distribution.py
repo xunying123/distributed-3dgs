@@ -2389,6 +2389,8 @@ def load_camera_from_cpu_to_all_gpu_for_eval(
                 )
     else:
         for camera in batched_cameras:
+            if camera.original_image_backup is None and camera.image_path is not None:
+                camera.load_image_from_disk()
             camera.original_image = camera.original_image_backup.cuda()
 
 
@@ -2411,6 +2413,9 @@ def load_camera_from_cpu_to_all_gpu(batched_cameras, batched_strategies, gpuid2t
             if camera_id_in_batch == last_task[0]:
                 coverage_max_y = coverage_max_y_last_task
 
+            cam = batched_cameras[camera_id_in_batch]
+            if cam._lazy_loading and cam.original_image_backup is None:
+                cam.load_image_from_disk()
             batched_cameras[camera_id_in_batch].original_image = (
                 batched_cameras[camera_id_in_batch]
                 .original_image_backup[:, coverage_min_y:coverage_max_y, :]

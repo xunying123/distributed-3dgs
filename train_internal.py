@@ -336,6 +336,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             viewpoint_cam
         ) in batched_cameras:  # Release memory of locally rendered original_image
             viewpoint_cam.original_image = None
+            viewpoint_cam.unload_image()
         if args.nsys_profile:
             nvtx.range_pop()
         if utils.check_enable_python_timer():
@@ -478,6 +479,7 @@ def training_report(
                             l1_test += l1_loss(image, gt_image).mean().double()
                             psnr_test += psnr(image, gt_image).mean().double()
                         gt_camera.original_image = None
+                        gt_camera.unload_image()
                 psnr_test /= num_cameras
                 l1_test /= num_cameras
                 utils.print_rank_0(

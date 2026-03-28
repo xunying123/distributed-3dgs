@@ -206,7 +206,7 @@ class SceneDataset:
         self.camera_size = len(self.cameras)
         self.sample_camera_idx = []
         for i in range(self.camera_size):
-            if self.cameras[i].original_image_backup is not None:
+            if self.cameras[i].original_image_backup is not None or self.cameras[i]._lazy_loading:
                 self.sample_camera_idx.append(i)
         # print("Number of cameras with sample images: ", len(self.sample_camera_idx))
 

@@ -168,6 +168,7 @@ class DistributionParams(ParamGroup):
             10  # unit is GB, by default 10GB memory limit for dataset.
         )
         self.multiprocesses_image_loading = True
+        self.lazy_image_loading = False
         self.num_train_cameras = -1
         self.num_test_cameras = -1
 
@@ -296,6 +297,11 @@ def init_args(args):
         args.local_sampling = False
         # TODO: args.preload_dataset_to_gpu should be independent of args.local_sampling and args.distributed_dataset_storage
         # We can distributedly save dataset and preload every shard to GPU at the same time.
+    
+    if args.lazy_image_loading:
+        args.preload_dataset_to_gpu = False
+        args.distributed_dataset_storage = False
+        args.local_sampling = False
 
     if args.local_sampling:
         assert args.distributed_dataset_storage, "local_sampling works only when distributed_dataset_storage==True"

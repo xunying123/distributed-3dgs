@@ -34,7 +34,10 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
     # NOTE: we do not support downsampling here.
 
     # may use cam_info.uid
-    if (
+    if args.lazy_image_loading:
+        gt_image = None
+        loaded_mask = None
+    elif (
         (
             args.local_sampling
             and args.distributed_dataset_storage
@@ -80,6 +83,7 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
         gt_alpha_mask=loaded_mask,
         image_name=cam_info.image_name,
         uid=id,
+        image_path=cam_info.image_path,
     )
 
 
@@ -210,7 +214,9 @@ def decompressed_images_from_camInfos_multiprocess_sharedmem(
 def cameraList_from_camInfos(cam_infos, args):
     args = get_args()
 
-    if args.multiprocesses_image_loading:
+    if args.lazy_image_loading:
+        decompressed_images = [None for _ in cam_infos]
+    elif args.multiprocesses_image_loading:
         decompressed_images = decompressed_images_from_camInfos_multiprocess(
             cam_infos, args
         )

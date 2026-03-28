@@ -30,6 +30,7 @@ class Camera(nn.Module):
         gt_alpha_mask,
         image_name,
         uid,
+        image_path=None,
         trans=np.array([0.0, 0.0, 0.0]),
         scale=1.0,
     ):
@@ -42,6 +43,8 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.image_path = image_path
+        self._lazy_loading = False
 
         args = get_args()
         log_file = get_log_file()
@@ -49,7 +52,11 @@ class Camera(nn.Module):
         if args.time_image_loading:
             start_time = time.time()
 
-        if (
+        if args.lazy_image_loading:
+            self._lazy_loading = True
+            self.original_image_backup = None
+            self.image_height, self.image_width = utils.get_img_size()
+        elif (
             (
                 args.local_sampling
                 and args.distributed_dataset_storage
@@ -101,6 +108,23 @@ class Camera(nn.Module):
 
     def get_camera2world(self):
         return self.world_view_transform_backup.t().inverse()
+
+    def load_image_from_disk(self):
+        if self.original_image_backup is not None:
+            return
+        from PIL import Image
+        from utils.general_utils import PILtoTorch
+        args = get_args()
+        log_file = get_log_file()
+        resolution = (self.image_width, self.image_height)
+        pil_image = Image.open(self.image_path)
+        resized_image_rgb = PILtoTorch(pil_image, resolution, args, log_file)
+        self.original_image_backup = resized_image_rgb[:3, ...].contiguous()
+        pil_image.close()
+
+    def unload_image(self):
+        if self._lazy_loading:
+            self.original_image_backup = None
 
     def update(self, dx, dy, dz):
         # Update the position of this camera pose. TODO: support updating rotation of camera pose.
