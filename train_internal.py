@@ -324,8 +324,19 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         if param.grad is not None:
                             param.grad /= args.bsz
 
+                # if not args.stop_update_param:
+                #     gaussians.optimizer.step()
+                
                 if not args.stop_update_param:
-                    gaussians.optimizer.step()
+                    if args.sparse_adam:
+                        visibility_list = batched_screenspace_pkg[
+                            "batched_locally_preprocessed_visibility_filter"
+                        ]
+                        visibility_filter = torch.stack(visibility_list).any(dim=0)
+                        N = gaussians.get_xyz.shape[0]
+                        gaussians.optimizer.step(visibility_filter, N)
+                    else:
+                        gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 timers.stop("optimizer_step")
                 utils.check_initial_gpu_memory_usage("after optimizer step")

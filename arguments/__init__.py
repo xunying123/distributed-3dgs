@@ -116,6 +116,7 @@ class OptimizationParams(ParamGroup):
         self.scaling_lr = 0.005
         self.lr_scale_loss = 1.0
         self.lr_scale_pos_and_scale = 1.0
+        self.sparse_adam = False
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2

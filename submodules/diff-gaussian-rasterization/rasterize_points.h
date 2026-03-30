@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <tuple>
 #include <string>
+#include "cuda_rasterizer/adam.h"
 	
 		
 torch::Tensor markVisible(
@@ -186,6 +187,19 @@ torch::Tensor GetLocal2jIdsBoolAdjustMode6CUDA(
 	const torch::Tensor& radii,
 	const torch::Tensor& rectangles,
 	const pybind11::dict &args);
-
+	
+void adamUpdate(
+	torch::Tensor &param,
+	torch::Tensor &param_grad,
+	torch::Tensor &exp_avg,
+	torch::Tensor &exp_avg_sq,
+	torch::Tensor &visible,
+	const float lr,
+	const float b1,
+	const float b2,
+	const float eps,
+	const uint32_t N,
+	const uint32_t M
+);
 
 std::tuple<int, int, int> GetBlockXY();

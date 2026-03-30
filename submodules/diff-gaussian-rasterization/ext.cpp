@@ -28,6 +28,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("load_image_tiles_by_pos", &LoadImageTilesByPos);
   m.def("set_image_tiles_by_pos", &SetImageTilesByPos);
   m.def("get_pixels_compute_locally_and_in_rect", &GetPixelsComputeLocallyAndInRect);
-
+  m.def("adamUpdate", &adamUpdate);
   m.def("get_block_XY", &GetBlockXY);
 }

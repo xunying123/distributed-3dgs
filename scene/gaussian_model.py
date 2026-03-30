@@ -288,8 +288,12 @@ class GaussianModel:
                 "name": "rotation",
             },
         ]
-
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        if args.sparse_adam:
+            from diff_gaussian_rasterization import SparseGaussianAdam
+            self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
+        else:
+            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        # self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         # self.optimizer = torch.optim.SGD(l, lr=0.0, momentum=0.1)
 
         bsz = utils.get_args().bsz
