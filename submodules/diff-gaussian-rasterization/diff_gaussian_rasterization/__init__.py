@@ -219,14 +219,15 @@ class _RenderGaussians(torch.autograd.Function):
         # torch.cuda.synchronize()
         # render_forward_start_time = time.time()
 
-        num_rendered, color, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer = _C.render_gaussians(*args)
+        num_rendered, num_buckets, color, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = _C.render_gaussians(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.cuda_args = cuda_args
         ctx.num_rendered = num_rendered
+        ctx.num_buckets = num_buckets
         # ctx.render_forward_start_time = render_forward_start_time
-        ctx.save_for_backward(means2D, conic_opacity, rgb, geomBuffer, binningBuffer, imgBuffer, compute_locally, extended_compute_locally)
+        ctx.save_for_backward(means2D, conic_opacity, rgb, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, compute_locally, extended_compute_locally)
         ctx.mark_non_differentiable(n_render, n_consider, n_contrib)
 
         return color, n_render, n_consider, n_contrib
@@ -237,18 +238,20 @@ class _RenderGaussians(torch.autograd.Function):
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
+        num_buckets = ctx.num_buckets
         raster_settings = ctx.raster_settings
         cuda_args = ctx.cuda_args
         # render_forward_start_time = ctx.render_forward_start_time
-        means2D, conic_opacity, rgb, geomBuffer, binningBuffer, imgBuffer, compute_locally, extended_compute_locally = ctx.saved_tensors
+        means2D, conic_opacity, rgb, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, compute_locally, extended_compute_locally = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
                 num_rendered,
+                num_buckets,
                 geomBuffer,
                 binningBuffer,
                 imgBuffer,
-                compute_locally,# buffer
+                sampleBuffer,
                 grad_color,# gradient of output of this operator
                 means2D,
                 conic_opacity,

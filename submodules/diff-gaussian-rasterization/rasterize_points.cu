@@ -274,7 +274,7 @@ torch::Tensor GetDistributionStrategyCUDA(
 
 /////////////////////////////// Render ///////////////////////////////
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansCUDA(
 	const torch::Tensor& background,
     const int image_height,
@@ -309,17 +309,21 @@ RenderGaussiansCUDA(
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
   torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
   torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor sampleBuffer = torch::empty({0}, options.device(device));
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+  std::function<char*(size_t)> sampleFunc = resizeFunctional(sampleBuffer);
   
   int rendered = 0;
+  int n_bucket = 0;
   if(P != 0)
   {
 	  rendered = CudaRasterizer::Rasterizer::renderForward(
 		geomFunc,
 		binningFunc,
-		imgFunc,//buffer
+		imgFunc,
+		sampleFunc,//buffer
 	    P,
 		background.contiguous().data<float>(),
 		W, H,//image setting
@@ -333,20 +337,22 @@ RenderGaussiansCUDA(
 		n_render.contiguous().data<int>(),
 		n_consider.contiguous().data<int>(),
 		n_contrib.contiguous().data<int>(),//output
+		&n_bucket,
 		debug,
 		args);
   }
-  return std::make_tuple(rendered, out_color, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer);
+  return std::make_tuple(rendered, n_bucket, out_color, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer, sampleBuffer);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const int R,
+	const int B,
 	const torch::Tensor& geomBuffer,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const torch::Tensor& compute_locally,
+	const torch::Tensor& sampleBuffer,
     const torch::Tensor& dL_dout_color,
 	const torch::Tensor& means2D,// (P, 2)
 	const torch::Tensor& conic_opacity,
@@ -366,13 +372,13 @@ RenderGaussiansBackwardCUDA(
   if(P != 0)
   {
 	  CudaRasterizer::Rasterizer::renderBackward(
-		P, R,
+		P, R, B,
 		background.contiguous().data<float>(),
 		W, H,//rasterization settings.  
 		reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 		reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
-		reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),//buffer that contains intermedia results
-		compute_locally.contiguous().data<bool>(),
+		reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
+		reinterpret_cast<char*>(sampleBuffer.contiguous().data_ptr()),//buffer that contains intermedia results
 		dL_dout_color.contiguous().data<float>(),//gradient of output
 		dL_dmeans2D.contiguous().data<float>(),
 		dL_dconic.contiguous().data<float>(),

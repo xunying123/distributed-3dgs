@@ -115,6 +115,7 @@ namespace CudaRasterizer
 			std::function<char* (size_t)> geometryBuffer,
 			std::function<char* (size_t)> binningBuffer,
 			std::function<char* (size_t)> imageBuffer,
+			std::function<char* (size_t)> sampleBuffer,
 			const int P,
 			const float* background,
 			const int width, int height,
@@ -128,17 +129,18 @@ namespace CudaRasterizer
 			int* n_render,// TODO: int* could not match with uint32_t*. error may occur, especially when the number is large.
 			int* n_consider,// If your uint32_t array contains values higher than 2,147,483,647, they will overflow when converted to int.
 			int* n_contrib,//array of results for this function. 
+			int* n_bucket,
 			bool debug,
 			const pybind11::dict &args);
 
 		static void renderBackward(
-			const int P, int R,
+			const int P, int R, int B,
 			const float* background,
 			const int width, int height,//rasterization settings. 
 			char* geom_buffer,
 			char* binning_buffer,
 			char* img_buffer,//buffer that contains intermedia results
-			bool* compute_locally,
+			char* sample_buffer,
 			const float* dL_dpix,//gradient of output
 			float* dL_dmean2D,
 			float* dL_dconic,

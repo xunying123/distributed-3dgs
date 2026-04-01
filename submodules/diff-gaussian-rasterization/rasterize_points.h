@@ -133,7 +133,7 @@ torch::Tensor GetPixelsComputeLocallyAndInRect(
 /////////////////////////////// Render ///////////////////////////////
 
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansCUDA(
 	const torch::Tensor& background,
     const int image_height,
@@ -151,10 +151,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const int R,
+	const int B,
 	const torch::Tensor& geomBuffer,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const torch::Tensor& compute_locally,
+	const torch::Tensor& sampleBuffer,
     const torch::Tensor& dL_dout_color,
 	const torch::Tensor& means2D,
 	const torch::Tensor& conic_opacity,

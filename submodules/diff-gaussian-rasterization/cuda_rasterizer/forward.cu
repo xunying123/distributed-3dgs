@@ -9,6 +9,7 @@
  * For inquiries contact  george.drettakis@inria.fr
  */
 
+#include <cub/cub.cuh> // order important
 #include "forward.h"
 #include "auxiliary.h"
 #include "timers.cu"
@@ -265,45 +266,24 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
+	const uint32_t* __restrict__ per_tile_bucket_offset,
+	uint32_t* __restrict__ bucket_to_tile,
+	float* __restrict__ sampled_T,
+	float* __restrict__ sampled_ar,
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
+	uint32_t* __restrict__ max_contrib,
 	uint32_t* __restrict__ n_contrib2loss,
-	bool* __restrict__ compute_locally,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
-
-	// method 1
-	// uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	// auto block_id = block.group_index().y * horizontal_blocks + block.group_index().x;
-
-	// method 2: this seems to be faster than others, in set of experiments: fix_com_loc_flc_1/2/3
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	auto block_id = block.group_index().y * horizontal_blocks + block.group_index().x;
-	if (!compute_locally[block_id])
-		return;
-
-	// method 3
-	// __shared__ bool compute_locally_this_tile;
-	// __shared__ uint2 range_this_tile;
-	// if (block.thread_rank() == 0)
-	// {
-	// 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	// 	// TODO: in some cornor cases, todo==0 does not mean it is not computed locally.
-	// 	auto block_id = block.group_index().y * horizontal_blocks + block.group_index().x;
-	// 	compute_locally_this_tile = compute_locally[block_id];
-	// 	range_this_tile = ranges[block_id];
-	// }
-	// block.sync();
-	// if (!compute_locally_this_tile)
-	// 	return;
-
 
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
@@ -317,14 +297,20 @@ renderCUDA(
 	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
-	
-	// method 1 and 2
-	uint2 range = ranges[block_id];
-	// method 3
-	// uint2 range = range_this_tile;
-
+	uint32_t tile_id = block.group_index().y * horizontal_blocks + block.group_index().x;
+	uint2 range = ranges[tile_id];
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
+
+	// Per-tile bucket metadata used by per-gaussian backward pass.
+	uint32_t bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
+	int num_buckets = (toDo + 31) / 32;
+	for (int i = 0; i < (num_buckets + BLOCK_SIZE - 1) / BLOCK_SIZE; ++i)
+	{
+		int bucket_idx = i * BLOCK_SIZE + block.thread_rank();
+		if (bucket_idx < num_buckets)
+			bucket_to_tile[bbm + bucket_idx] = tile_id;
+	}
 
 	// Allocate storage for batches of collectively fetched data.
 	__shared__ int collected_id[BLOCK_SIZE];
@@ -360,6 +346,15 @@ renderCUDA(
 		// Iterate over current batch
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 		{
+			// Save sampled forward states every 32 splats for per-gaussian backward.
+			if (j % 32 == 0)
+			{
+				sampled_T[(bbm * BLOCK_SIZE) + block.thread_rank()] = T;
+				for (int ch = 0; ch < CHANNELS; ++ch)
+					sampled_ar[(bbm * BLOCK_SIZE * CHANNELS) + ch * BLOCK_SIZE + block.thread_rank()] = C[ch];
+				++bbm;
+			}
+
 			// Keep track of current position in range
 			contributor++;
 
@@ -410,34 +405,49 @@ renderCUDA(
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 	}
+
+	// Reduce max contributing index per tile.
+	typedef cub::BlockReduce<uint32_t, BLOCK_X, cub::BLOCK_REDUCE_WARP_REDUCTIONS, BLOCK_Y> BlockReduce;
+	__shared__ typename BlockReduce::TempStorage temp_storage;
+	last_contributor = BlockReduce(temp_storage).Reduce(last_contributor, cub::Max());
+	if (block.thread_rank() == 0)
+		max_contrib[tile_id] = last_contributor;
 }
 
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
+	const uint32_t* per_tile_bucket_offset,
+	uint32_t* bucket_to_tile,
+	float* sampled_T,
+	float* sampled_ar,
 	int W, int H,
 	const float2* means2D,
 	const float* colors,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
+	uint32_t* max_contrib,
 	uint32_t* n_contrib2loss,
-	bool* compute_locally,
 	const float* bg_color,
 	float* out_color)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
+		per_tile_bucket_offset,
+		bucket_to_tile,
+		sampled_T,
+		sampled_ar,
 		W, H,
 		means2D,
 		colors,
 		conic_opacity,
 		final_T,
 		n_contrib,
+		max_contrib,
 		n_contrib2loss,
-		compute_locally,
 		bg_color,
 		out_color);
 }

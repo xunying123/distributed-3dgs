@@ -17,6 +17,7 @@
 #include <numeric>
 #include <string>
 #include <cstdlib>
+#include <cfloat>
 #include <chrono>
 #include <cuda.h>
 #include "cuda_runtime.h"
@@ -69,11 +70,61 @@ __global__ void checkFrustum(int P,
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
 
+__device__ inline float evaluate_opacity_factor(const float dx, const float dy, const float4 co)
+{
+	return 0.5f * (co.x * dx * dx + co.z * dy * dy) + co.y * dx * dy;
+}
+
+template<uint32_t PATCH_WIDTH, uint32_t PATCH_HEIGHT>
+__device__ inline float max_contrib_power_rect_gaussian_float(
+	const float4 co,
+	const float2 mean,
+	const glm::vec2 rect_min,
+	const glm::vec2 rect_max,
+	glm::vec2& max_pos)
+{
+	const float x_min_diff = rect_min.x - mean.x;
+	const float x_left = x_min_diff > 0.0f;
+	const float not_in_x_range = x_left + (mean.x > rect_max.x);
+
+	const float y_min_diff = rect_min.y - mean.y;
+	const float y_above = y_min_diff > 0.0f;
+	const float not_in_y_range = y_above + (mean.y > rect_max.y);
+
+	max_pos = { mean.x, mean.y };
+	float max_contrib_power = 0.0f;
+
+	if ((not_in_y_range + not_in_x_range) > 0.0f)
+	{
+		const float px = x_left * rect_min.x + (1.0f - x_left) * rect_max.x;
+		const float py = y_above * rect_min.y + (1.0f - y_above) * rect_max.y;
+
+		const float dx = copysign(float(PATCH_WIDTH), x_min_diff);
+		const float dy = copysign(float(PATCH_HEIGHT), y_min_diff);
+
+		const float diffx = mean.x - px;
+		const float diffy = mean.y - py;
+
+		const float rcp_dxdxcox = __frcp_rn(PATCH_WIDTH * PATCH_WIDTH * co.x);
+		const float rcp_dydycoz = __frcp_rn(PATCH_HEIGHT * PATCH_HEIGHT * co.z);
+
+		const float tx = not_in_y_range * __saturatef((dx * co.x * diffx + dx * co.y * diffy) * rcp_dxdxcox);
+		const float ty = not_in_x_range * __saturatef((dy * co.y * diffx + dy * co.z * diffy) * rcp_dydycoz);
+		max_pos = { px + tx * dx, py + ty * dy };
+
+		const float2 max_pos_diff = { mean.x - max_pos.x, mean.y - max_pos.y };
+		max_contrib_power = evaluate_opacity_factor(max_pos_diff.x, max_pos_diff.y, co);
+	}
+
+	return max_contrib_power;
+}
+
 // Generates one key/value pair for all Gaussian / tile overlaps. 
 // Run once per Gaussian (1:N mapping).
 __global__ void duplicateWithKeys(
 	int P,
 	const float2* points_xy,
+	const float4* __restrict__ conic_opacity,
 	const float* depths,
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
@@ -91,9 +142,14 @@ __global__ void duplicateWithKeys(
 	{
 		// Find this Gaussian's offset in buffer for writing keys/values.
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+		const uint32_t offset_to = offsets[idx];
 		uint2 rect_min, rect_max;
 
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+		const float2 xy = points_xy[idx];
+		const float4 co = conic_opacity[idx];
+		const float opacity_threshold = 1.0f / 255.0f;
+		const float opacity_factor_threshold = logf(co.w / opacity_threshold);
 
 		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,
@@ -105,13 +161,32 @@ __global__ void duplicateWithKeys(
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			if (compute_locally[y * grid.x + x])
 			{
-				uint64_t key = y * grid.x + x;
-				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
-				gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx;
-				off++;
+				const glm::vec2 tile_min(x * BLOCK_X, y * BLOCK_Y);
+				const glm::vec2 tile_max((x + 1) * BLOCK_X - 1, (y + 1) * BLOCK_Y - 1);
+				glm::vec2 max_pos;
+				const float max_opac_factor = max_contrib_power_rect_gaussian_float<BLOCK_X - 1, BLOCK_Y - 1>(
+					co, xy, tile_min, tile_max, max_pos);
+				if (max_opac_factor <= opacity_factor_threshold)
+				{
+					uint64_t key = y * grid.x + x;
+					key <<= 32;
+					key |= *((uint32_t*)&depths[idx]);
+					gaussian_keys_unsorted[off] = key;
+					gaussian_values_unsorted[off] = idx;
+					off++;
+				}
 			}
+		}
+
+		// Keep fixed-size slots by filling culled entries with invalid keys.
+		for (; off < offset_to; ++off)
+		{
+			uint64_t key = static_cast<uint32_t>(-1);
+			key <<= 32;
+			const float depth = FLT_MAX;
+			key |= *((uint32_t*)&depth);
+			gaussian_values_unsorted[off] = static_cast<uint32_t>(-1);
+			gaussian_keys_unsorted[off] = key;
 		}
 	}
 }
@@ -128,20 +203,29 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 	// Read tile ID from key. Update start/end of tile range if at limit.
 	uint64_t key = point_list_keys[idx];
 	uint32_t currtile = key >> 32;
+	bool valid_tile = currtile != static_cast<uint32_t>(-1);
 	if (idx == 0)
-		ranges[currtile].x = 0;
+	{
+		if (valid_tile)
+			ranges[currtile].x = 0;
+	}
 	else
 	{
 		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
+		bool valid_prevtile = prevtile != static_cast<uint32_t>(-1);
 		if (currtile != prevtile)
 		{
-			ranges[prevtile].y = idx;
-			ranges[currtile].x = idx;
+			if (valid_prevtile)
+				ranges[prevtile].y = idx;
+			if (valid_tile)
+				ranges[currtile].x = idx;
 		}
 	}
-	if (idx == L - 1)
+	if (idx == L - 1 && valid_tile)
 		ranges[currtile].y = L;
 }
+
+__global__ void perTileBucketCount(int T, const uint2* ranges, uint32_t* bucketCount);
 
 // Mark Gaussians as visible/invisible, based on view frustum testing
 void CudaRasterizer::Rasterizer::markVisible(
@@ -186,7 +270,22 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	obtain(chunk, img.n_contrib, N, 128);
 	obtain(chunk, img.n_contrib2loss, N, 128);
 	obtain(chunk, img.ranges, N, 128);
+	obtain(chunk, img.max_contrib, N, 128);
+	obtain(chunk, img.pixel_colors, N * NUM_CHANNELS, 128);
+	obtain(chunk, img.bucket_count, N, 128);
+	obtain(chunk, img.bucket_offsets, N, 128);
+	cub::DeviceScan::InclusiveSum(nullptr, img.bucket_count_scan_size, img.bucket_count, img.bucket_count, N);
+	obtain(chunk, img.bucket_count_scanning_space, img.bucket_count_scan_size, 128);
 	return img;
+}
+
+CudaRasterizer::SampleState CudaRasterizer::SampleState::fromChunk(char*& chunk, size_t B)
+{
+	SampleState sample;
+	obtain(chunk, sample.bucket_to_tile, B, 128);
+	obtain(chunk, sample.T, B * BLOCK_X * BLOCK_Y, 128);
+	obtain(chunk, sample.ar, NUM_CHANNELS * B * BLOCK_X * BLOCK_Y, 128);
+	return sample;
 }
 
 CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P)
@@ -517,6 +616,7 @@ int CudaRasterizer::Rasterizer::renderForward(
 	std::function<char* (size_t)> geometryBuffer,
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
+	std::function<char* (size_t)> sampleBuffer,
 	const int P,
 	const float* background,
 	const int width, int height,
@@ -530,6 +630,7 @@ int CudaRasterizer::Rasterizer::renderForward(
 	int* n_render,// TODO: int* could not match with uint32_t*. error may occur, especially when the number is large.
 	int* n_consider,// If your uint32_t array contains values higher than 2,147,483,647, they will overflow when converted to int.
 	int* n_contrib,//array of results for this function. 
+	int* n_bucket,
 	bool debug,
 	const pybind11::dict &args)
 {
@@ -583,6 +684,7 @@ int CudaRasterizer::Rasterizer::renderForward(
 	duplicateWithKeys << <(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >> > (
 		P,
 		means2D,
+		conic_opacity,
 		depths,
 		geomState.point_offsets,
 		binningState.point_list_keys_unsorted,
@@ -617,6 +719,25 @@ int CudaRasterizer::Rasterizer::renderForward(
 	CHECK_CUDA(, debug)
 	timer.stop("60 identifyTileRanges");
 
+	// Build per-tile bucket offsets used by per-gaussian backward kernel.
+	const int num_tiles = tile_grid.x * tile_grid.y;
+	perTileBucketCount<<<(num_tiles + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE>>>(
+		num_tiles, imgState.ranges, imgState.bucket_count);
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(
+		imgState.bucket_count_scanning_space,
+		imgState.bucket_count_scan_size,
+		imgState.bucket_count,
+		imgState.bucket_offsets,
+		num_tiles), debug);
+	int bucket_sum = 0;
+	if (num_tiles > 0)
+		CHECK_CUDA(cudaMemcpy(&bucket_sum, imgState.bucket_offsets + num_tiles - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	*n_bucket = bucket_sum;
+
+	size_t sample_chunk_size = required<SampleState>(bucket_sum);
+	char* sample_chunkptr = sampleBuffer(sample_chunk_size);
+	SampleState sampleState = SampleState::fromChunk(sample_chunkptr, bucket_sum);
+
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = rgb;
 	timer.start("70 render");
@@ -624,24 +745,29 @@ int CudaRasterizer::Rasterizer::renderForward(
 		tile_grid, block,
 		imgState.ranges,
 		binningState.point_list,
+		imgState.bucket_offsets,
+		sampleState.bucket_to_tile,
+		sampleState.T,
+		sampleState.ar,
 		width, height,
 		means2D,
 		feature_ptr,
 		conic_opacity,
 		imgState.accum_alpha,
 		imgState.n_contrib,
+		imgState.max_contrib,
 		imgState.n_contrib2loss,
-		compute_locally,
 		background,
 		out_color), debug)
 	timer.stop("70 render");
+	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHANNELS, cudaMemcpyDeviceToDevice), debug);
 
 	// TODO: write a kernel to sum a block for n_contrib2loss and save the result in contrib. 
 	// We may have different implementation.
 
 	timer.start("81 sum_n_render");
-	get_n_render<<< (tile_num + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
-		tile_num,
+	get_n_render<<< (num_tiles + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
+		num_tiles,
 		imgState.ranges,
 		n_render
 	);
@@ -760,13 +886,13 @@ int CudaRasterizer::Rasterizer::renderForward(
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
 void CudaRasterizer::Rasterizer::renderBackward(
-	const int P, int R,
+	const int P, int R, int B,
 	const float* background,
 	const int width, int height,//rasterization settings. 
 	char* geom_buffer,
 	char* binning_buffer,
 	char* img_buffer,
-	bool* compute_locally,//buffer that contains intermedia results
+	char* sample_buffer,
 	const float* dL_dpix,//gradient of output
 	float* dL_dmean2D,//(P, 3)
 	float* dL_dconic,
@@ -784,6 +910,7 @@ void CudaRasterizer::Rasterizer::renderBackward(
 
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
+	SampleState sampleState = SampleState::fromChunk(sample_buffer, B);
 
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
@@ -798,14 +925,19 @@ void CudaRasterizer::Rasterizer::renderBackward(
 		block,
 		imgState.ranges,
 		binningState.point_list,
-		width, height,
+		width, height, R, B,
+		imgState.bucket_offsets,
+		sampleState.bucket_to_tile,
+		sampleState.T,
+		sampleState.ar,
 		background,
 		means2D,
 		conic_opacity,
 		color_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
-		compute_locally,
+		imgState.max_contrib,
+		imgState.pixel_colors,
 		dL_dpix,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
@@ -821,4 +953,15 @@ void CudaRasterizer::Rasterizer::renderBackward(
 	if (zhx_time && iteration % log_interval == 1) {
 		timer.printAllTimes(iteration, world_size, global_rank, log_folder, false);
 	}
+}
+
+__global__ void perTileBucketCount(int T, const uint2* ranges, uint32_t* bucketCount)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= T)
+		return;
+	uint2 range = ranges[idx];
+	int num_splats = range.y - range.x;
+	int num_buckets = (num_splats + 31) / 32;
+	bucketCount[idx] = (uint32_t)num_buckets;
 }

@@ -395,6 +395,166 @@ __global__ void preprocessCUDA(
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
+template<uint32_t C>
+__global__ void PerGaussianRenderCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H, int B,
+	const uint32_t* __restrict__ per_tile_bucket_offset,
+	const uint32_t* __restrict__ bucket_to_tile,
+	const float* __restrict__ sampled_T,
+	const float* __restrict__ sampled_ar,
+	const float* __restrict__ bg_color,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ colors,
+	const float* __restrict__ final_Ts,
+	const uint32_t* __restrict__ n_contrib,
+	const uint32_t* __restrict__ max_contrib,
+	const float* __restrict__ pixel_colors,
+	const float* __restrict__ dL_dpixels,
+	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dconic2D,
+	float* __restrict__ dL_dopacity,
+	float* __restrict__ dL_dcolors)
+{
+	auto block = cg::this_thread_block();
+	auto my_warp = cg::tiled_partition<32>(block);
+	uint32_t global_bucket_idx = block.group_index().x * my_warp.meta_group_size() + my_warp.meta_group_rank();
+	if (global_bucket_idx >= (uint32_t)B)
+		return;
+
+	uint32_t tile_id = bucket_to_tile[global_bucket_idx];
+	uint2 range = ranges[tile_id];
+	int num_splats_in_tile = range.y - range.x;
+	uint32_t bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
+	int bucket_idx_in_tile = global_bucket_idx - bbm;
+	int splat_idx_in_tile = bucket_idx_in_tile * 32 + my_warp.thread_rank();
+	int splat_idx_global = range.x + splat_idx_in_tile;
+	bool valid_splat = (splat_idx_in_tile < num_splats_in_tile);
+
+	// If first gaussian in bucket is after tile's max contributor, the bucket is useless.
+	if (bucket_idx_in_tile * 32 >= (int)max_contrib[tile_id])
+		return;
+
+	int gaussian_idx = 0;
+	float2 xy = { 0.0f, 0.0f };
+	float4 con_o = { 0.0f, 0.0f, 0.0f, 0.0f };
+	float c[C] = { 0.0f };
+	if (valid_splat)
+	{
+		gaussian_idx = point_list[splat_idx_global];
+		xy = points_xy_image[gaussian_idx];
+		con_o = conic_opacity[gaussian_idx];
+		for (int ch = 0; ch < C; ++ch)
+			c[ch] = colors[gaussian_idx * C + ch];
+	}
+
+	float reg_dL_dmean2D_x = 0.0f;
+	float reg_dL_dmean2D_y = 0.0f;
+	float reg_dL_dconic2D_x = 0.0f;
+	float reg_dL_dconic2D_y = 0.0f;
+	float reg_dL_dconic2D_w = 0.0f;
+	float reg_dL_dopacity = 0.0f;
+	float reg_dL_dcolors[C] = { 0.0f };
+
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 tile = { tile_id % horizontal_blocks, tile_id / horizontal_blocks };
+	const uint2 pix_min = { tile.x * BLOCK_X, tile.y * BLOCK_Y };
+
+	float T = 0.0f;
+	float T_final = 0.0f;
+	int last_contributor = 0;
+	float ar[C] = { 0.0f };
+	float dL_dpixel[C] = { 0.0f };
+	const float ddelx_dx = 0.5f * W;
+	const float ddely_dy = 0.5f * H;
+
+	for (int i = 0; i < BLOCK_SIZE + 31; ++i)
+	{
+		T = my_warp.shfl_up(T, 1);
+		last_contributor = my_warp.shfl_up(last_contributor, 1);
+		T_final = my_warp.shfl_up(T_final, 1);
+		for (int ch = 0; ch < C; ++ch)
+		{
+			ar[ch] = my_warp.shfl_up(ar[ch], 1);
+			dL_dpixel[ch] = my_warp.shfl_up(dL_dpixel[ch], 1);
+		}
+
+		int idx = i - my_warp.thread_rank();
+		const uint2 pix = { pix_min.x + idx % BLOCK_X, pix_min.y + idx / BLOCK_X };
+		const uint32_t pix_id = W * pix.y + pix.x;
+		const float2 pixf = { (float)pix.x, (float)pix.y };
+		bool valid_pixel = pix.x < W && pix.y < H;
+
+		if (valid_splat && valid_pixel && my_warp.thread_rank() == 0 && idx < BLOCK_SIZE)
+		{
+			T = sampled_T[global_bucket_idx * BLOCK_SIZE + idx];
+			T_final = final_Ts[pix_id];
+			for (int ch = 0; ch < C; ++ch)
+				ar[ch] = -(pixel_colors[ch * H * W + pix_id] - T_final * bg_color[ch]) +
+					sampled_ar[global_bucket_idx * BLOCK_SIZE * C + ch * BLOCK_SIZE + idx];
+			last_contributor = n_contrib[pix_id];
+			for (int ch = 0; ch < C; ++ch)
+				dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
+		}
+
+		if (valid_splat && valid_pixel && 0 <= idx && idx < BLOCK_SIZE)
+		{
+			if (splat_idx_in_tile >= (int)last_contributor)
+				continue;
+
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+			const float G = exp(power);
+			const float alpha = min(0.99f, con_o.w * G);
+			if (alpha < 1.0f / 255.0f)
+				continue;
+
+			const float dchannel_dcolor = alpha * T;
+			float bg_dot_dpixel = 0.0f;
+			float dL_dalpha = 0.0f;
+			for (int ch = 0; ch < C; ++ch)
+			{
+				ar[ch] += T * alpha * c[ch];
+				const float dL_dchannel = dL_dpixel[ch];
+				reg_dL_dcolors[ch] += dchannel_dcolor * dL_dchannel;
+				dL_dalpha += ((c[ch] * T) - (1.0f / (1.0f - alpha)) * (-ar[ch])) * dL_dchannel;
+				bg_dot_dpixel += bg_color[ch] * dL_dchannel;
+			}
+			dL_dalpha += (-T_final / (1.0f - alpha)) * bg_dot_dpixel;
+			T *= (1.0f - alpha);
+
+			const float dL_dG = con_o.w * dL_dalpha;
+			const float gdx = G * d.x;
+			const float gdy = G * d.y;
+			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+			reg_dL_dmean2D_x += dL_dG * dG_ddelx * ddelx_dx;
+			reg_dL_dmean2D_y += dL_dG * dG_ddely * ddely_dy;
+			reg_dL_dconic2D_x += -0.5f * gdx * d.x * dL_dG;
+			reg_dL_dconic2D_y += -0.5f * gdx * d.y * dL_dG;
+			reg_dL_dconic2D_w += -0.5f * gdy * d.y * dL_dG;
+			reg_dL_dopacity += G * dL_dalpha;
+		}
+	}
+
+	if (valid_splat)
+	{
+		atomicAdd(&dL_dmean2D[gaussian_idx].x, reg_dL_dmean2D_x);
+		atomicAdd(&dL_dmean2D[gaussian_idx].y, reg_dL_dmean2D_y);
+		atomicAdd(&dL_dconic2D[gaussian_idx].x, reg_dL_dconic2D_x);
+		atomicAdd(&dL_dconic2D[gaussian_idx].y, reg_dL_dconic2D_y);
+		atomicAdd(&dL_dconic2D[gaussian_idx].w, reg_dL_dconic2D_w);
+		atomicAdd(&dL_dopacity[gaussian_idx], reg_dL_dopacity);
+		for (int ch = 0; ch < C; ++ch)
+			atomicAdd(&dL_dcolors[gaussian_idx * C + ch], reg_dL_dcolors[ch]);
+	}
+}
+
 // Backward version of the rendering procedure.
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
@@ -484,6 +644,10 @@ renderCUDA(
 	if (inside)
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+	float bg_dot_dpixel = 0.0f;
+	if (inside)
+		for (int i = 0; i < C; i++)
+			bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
@@ -529,6 +693,8 @@ renderCUDA(
 				continue;
 
 			const float G = exp(power);
+			if (con_o.w * G > 0.99f)
+				continue;
 			const float alpha = min(0.99f, con_o.w * G);
 			if (alpha < 1.0f / 255.0f)
 				continue;
@@ -561,9 +727,6 @@ renderCUDA(
 
 			// Account for fact that alpha also influences how much of
 			// the background color is added if nothing left to blend
-			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++)
-				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
@@ -655,34 +818,48 @@ void BACKWARD::preprocess(
 }
 
 void BACKWARD::render(
-	const dim3 grid, const dim3 block,
+	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, int R, int B,
+	const uint32_t* per_bucket_tile_offset,
+	const uint32_t* bucket_to_tile,
+	const float* sampled_T,
+	const float* sampled_ar,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
-	const bool* compute_locally,
+	const uint32_t* max_contrib,
+	const float* pixel_colors,
 	const float* dL_dpixels,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	if (B <= 0)
+		return;
+
+	const int THREADS = 256;
+	PerGaussianRenderCUDA<NUM_CHANNELS><<<((B * 32) + THREADS - 1) / THREADS, THREADS>>>(
 		ranges,
 		point_list,
-		W, H,
+		W, H, B,
+		per_bucket_tile_offset,
+		bucket_to_tile,
+		sampled_T,
+		sampled_ar,
 		bg_color,
 		means2D,
 		conic_opacity,
 		colors,
 		final_Ts,
 		n_contrib,
-		compute_locally,
+		max_contrib,
+		pixel_colors,
 		dL_dpixels,
 		dL_dmean2D,
 		dL_dconic2D,
