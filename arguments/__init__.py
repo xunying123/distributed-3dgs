@@ -155,6 +155,12 @@ class DistributionParams(ParamGroup):
             1.1  # threshold to apply redistribution for 3DGS storage location
         )
         self.sync_grad_mode = "dense"  # "dense", "sparse", "fused_dense", "fused_sparse" gradient synchronization. Only use when gaussians_distribution is False.
+        self.sparse_all_to_all_backward = (
+            False  # if True, use sparse backward communication for screenspace all_to_all.
+        )
+        self.log_sparse_all_to_all_stats = (
+            False  # if True, log sparse backward communication statistics.
+        )
         self.grad_normalization_mode = "none"  # "divide_by_visible_count", "square_multiply_by_visible_count", "multiply_by_visible_count", "none" gradient normalization mode.
 
         # Dataset and Model save
