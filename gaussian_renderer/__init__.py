@@ -106,15 +106,6 @@ class _SparseGradAllToAll(torch.autograd.Function):
             for cam_idx, grad_output in enumerate(grad_outputs)
         ]
 
-        grad_to_peer = []
-        for peer in range(world_size):
-            grad_to_peer.append(
-                torch.cat(
-                    [grad_chunks_per_camera[cam_idx][peer] for cam_idx in range(num_cameras)],
-                    dim=0,
-                ).contiguous()
-            )
-
         sparse_index_send = []
         sparse_value_send = []
         sparse_count_send = []
@@ -122,17 +113,43 @@ class _SparseGradAllToAll(torch.autograd.Function):
         count_dtype = torch.int32
 
         for peer in range(world_size):
-            peer_grad = grad_to_peer[peer]
-            if peer_grad.shape[0] == 0:
-                nonzero_rows = torch.empty(0, dtype=index_dtype, device=peer_grad.device)
-                sparse_values = peer_grad
+            peer_sparse_indices = []
+            peer_sparse_values = []
+            peer_row_offset = 0
+
+            for cam_idx in range(num_cameras):
+                cam_grad = grad_chunks_per_camera[cam_idx][peer]
+                if cam_grad.shape[0] == 0:
+                    continue
+
+                nonzero_rows = torch.nonzero(
+                    cam_grad.ne(0).any(dim=1), as_tuple=False
+                ).squeeze(1)
+                if nonzero_rows.numel() > 0:
+                    peer_sparse_indices.append(nonzero_rows + peer_row_offset)
+                    peer_sparse_values.append(cam_grad[nonzero_rows])
+                peer_row_offset += cam_grad.shape[0]
+
+            if peer_sparse_indices:
+                nonzero_rows = torch.cat(peer_sparse_indices, dim=0).contiguous()
+                sparse_values = torch.cat(peer_sparse_values, dim=0).contiguous()
             else:
-                nonzero_rows = torch.nonzero(peer_grad.ne(0).any(dim=1), as_tuple=False).squeeze(1)
-                sparse_values = peer_grad[nonzero_rows].contiguous()
+                nonzero_rows = torch.empty(
+                    0, dtype=index_dtype, device=grad_outputs[0].device
+                )
+                sparse_values = torch.empty(
+                    (0,) + grad_outputs[0].shape[1:],
+                    dtype=grad_outputs[0].dtype,
+                    device=grad_outputs[0].device,
+                )
             sparse_index_send.append(nonzero_rows.contiguous())
             sparse_value_send.append(sparse_values)
             sparse_count_send.append(
-                torch.tensor([int(nonzero_rows.numel())], dtype=count_dtype, device=peer_grad.device)
+                torch.tensor(
+                    [int(nonzero_rows.numel())],
+                    dtype=count_dtype,
+                    device=grad_outputs[0].device,
+                )
             )
 
         sparse_count_recv = [
@@ -159,7 +176,6 @@ class _SparseGradAllToAll(torch.autograd.Function):
                     device=grad_outputs[0].device,
                 )
             )
-        nvtx.push_range("backward nccl", color="red")
         torch.distributed.all_to_all(
             output_tensor_list=sparse_index_recv,
             input_tensor_list=sparse_index_send,
@@ -170,50 +186,58 @@ class _SparseGradAllToAll(torch.autograd.Function):
             input_tensor_list=sparse_value_send,
             group=group,
         )
-        nvtx.pop_range()
 
         grad_inputs = [
             torch.zeros(shape, dtype=grad_outputs[0].dtype, device=grad_outputs[0].device)
             for shape in input_shapes
         ]
 
-        dense_grad_from_peer = []
-        peer_camera_sizes = []
         local_dense_rows = 0
         local_sparse_rows = 0
         local_dense_bytes = 0
         local_sparse_bytes = 0
+        row_bytes = math.prod(grad_outputs[0].shape[1:]) * grad_outputs[0].element_size()
         for peer in range(world_size):
             peer_sizes = [
                 int(local_to_gpuj_camk_send_ids[peer][cam_idx].shape[0])
                 for cam_idx in range(num_cameras)
             ]
-            peer_camera_sizes.append(peer_sizes)
             total_peer_rows = sum(peer_sizes)
             local_dense_rows += total_peer_rows
             local_sparse_rows += int(sparse_index_send[peer].numel())
-            peer_dense_grad = torch.zeros(
-                (total_peer_rows,) + grad_outputs[0].shape[1:],
-                dtype=grad_outputs[0].dtype,
-                device=grad_outputs[0].device,
-            )
-            if sparse_index_recv[peer].numel() > 0:
-                peer_dense_grad[sparse_index_recv[peer]] = sparse_value_recv[peer]
-            dense_grad_from_peer.append(peer_dense_grad)
-            local_dense_bytes += _nbytes(peer_dense_grad)
+            local_dense_bytes += total_peer_rows * row_bytes
             local_sparse_bytes += (
                 _nbytes(sparse_count_send[peer])
                 + _nbytes(sparse_index_send[peer])
                 + _nbytes(sparse_value_send[peer])
             )
 
-        for peer in range(world_size):
-            split_peer_grad = dense_grad_from_peer[peer].split(peer_camera_sizes[peer], dim=0)
+            if sparse_index_recv[peer].numel() == 0:
+                continue
+
+            cam_start = 0
             for cam_idx in range(num_cameras):
-                if split_peer_grad[cam_idx].shape[0] == 0:
+                cam_size = peer_sizes[cam_idx]
+                if cam_size == 0:
+                    continue
+                cam_end = cam_start + cam_size
+                sparse_mask = torch.logical_and(
+                    sparse_index_recv[peer] >= cam_start,
+                    sparse_index_recv[peer] < cam_end,
+                )
+                sparse_rows_in_cam = torch.nonzero(sparse_mask, as_tuple=False).squeeze(1)
+                if sparse_rows_in_cam.numel() == 0:
+                    cam_start = cam_end
                     continue
                 idx = local_to_gpuj_camk_send_ids[peer][cam_idx].reshape(-1)
-                grad_inputs[cam_idx][idx] += split_peer_grad[cam_idx]
+                idx = idx.to(device=grad_outputs[0].device, non_blocking=True)
+                row_ids = idx[sparse_index_recv[peer][sparse_rows_in_cam] - cam_start]
+                grad_inputs[cam_idx].index_add_(
+                    0,
+                    row_ids,
+                    sparse_value_recv[peer][sparse_rows_in_cam],
+                )
+                cam_start = cam_end
 
         args = utils.get_args()
         iteration = utils.get_cur_iter()
@@ -812,6 +836,32 @@ def all_to_all_communication_final(
     gpui_to_gpuj_imgk_size = gpui_to_gpuj_imgk_size.cpu().numpy().tolist()
 
     def one_all_to_all(batched_tensors, use_function_version=False):
+        if use_function_version and utils.get_args().sparse_all_to_all_backward:
+            tensors_per_camera = _SparseGradAllToAll.apply(
+                utils.DEFAULT_GROUP,
+                gpui_to_gpuj_imgk_size,
+                local_to_gpuj_camk_send_ids,
+                "all_to_all_communication_final",
+                *batched_tensors,
+            )
+            if (iteration - 1) % 250 == 0:
+                row_width = math.prod(batched_tensors[0].shape[1:])
+                row_bytes = row_width * batched_tensors[0].element_size()
+                send_entries = sum(
+                    int(local_to_gpuj_camk_send_ids[i][k].shape[0])
+                    for i in range(utils.DEFAULT_GROUP.size())
+                    for k in range(num_cameras)
+                )
+                recv_entries = sum(
+                    int(gpui_to_gpuj_imgk_size[i][utils.DEFAULT_GROUP.rank()][k])
+                    for i in range(utils.DEFAULT_GROUP.size())
+                    for k in range(num_cameras)
+                )
+                send_bytes = send_entries * row_bytes
+                recv_bytes = recv_entries * row_bytes
+                log_file.write(f"[iter {iteration}] send={send_bytes/1e6:.2f}MB recv={recv_bytes/1e6:.2f}MB "f"send_entries={send_entries} recv_entries={recv_entries} \n")
+            return tensors_per_camera
+
         tensor_to_rki = []
         tensor_from_rki = []
         for i in range(utils.DEFAULT_GROUP.size()):
@@ -837,44 +887,33 @@ def all_to_all_communication_final(
         send_entries = sum(int(t.shape[0]) for t in tensor_to_rki)
         recv_entries = sum(int(t.shape[0]) for t in tensor_from_rki)
 
-        if use_function_version and utils.get_args().sparse_all_to_all_backward:
-            tensors_per_camera = _SparseGradAllToAll.apply(
-                utils.DEFAULT_GROUP,
-                gpui_to_gpuj_imgk_size,
-                local_to_gpuj_camk_send_ids,
-                "all_to_all_communication_final",
-                *batched_tensors,
+        if use_function_version:
+            dist_func.all_to_all(
+                output_tensor_list=tensor_from_rki,
+                input_tensor_list=tensor_to_rki,
+                group=utils.DEFAULT_GROUP,
             )
         else:
-            if (
-                use_function_version
-            ):  # FIXME: there is error if I use torch.distributed.nn.functional to replace dist_func here. So weird.
-                dist_func.all_to_all(
-                    output_tensor_list=tensor_from_rki,
-                    input_tensor_list=tensor_to_rki,
-                    group=utils.DEFAULT_GROUP,
-                )
-            else:
-                torch.distributed.all_to_all(
-                    output_tensor_list=tensor_from_rki,
-                    input_tensor_list=tensor_to_rki,
-                    group=utils.DEFAULT_GROUP,
-                )
-            # tensor_from_rki: (world_size, (all data received from all other GPUs))
-            for i in range(utils.DEFAULT_GROUP.size()):
-                # -> (world_size, num_cameras, *)
-                tensor_from_rki[i] = tensor_from_rki[i].split(
-                    gpui_to_gpuj_imgk_size[i][utils.DEFAULT_GROUP.rank()], dim=0
-                )
+            torch.distributed.all_to_all(
+                output_tensor_list=tensor_from_rki,
+                input_tensor_list=tensor_to_rki,
+                group=utils.DEFAULT_GROUP,
+            )
+        # tensor_from_rki: (world_size, (all data received from all other GPUs))
+        for i in range(utils.DEFAULT_GROUP.size()):
+            # -> (world_size, num_cameras, *)
+            tensor_from_rki[i] = tensor_from_rki[i].split(
+                gpui_to_gpuj_imgk_size[i][utils.DEFAULT_GROUP.rank()], dim=0
+            )
 
-            tensors_per_camera = []
-            for k in range(num_cameras):
-                tensors_per_camera.append(
-                    torch.cat(
-                        [tensor_from_rki[i][k] for i in range(utils.DEFAULT_GROUP.size())],
-                        dim=0,
-                    ).contiguous()
-                )
+        tensors_per_camera = []
+        for k in range(num_cameras):
+            tensors_per_camera.append(
+                torch.cat(
+                    [tensor_from_rki[i][k] for i in range(utils.DEFAULT_GROUP.size())],
+                    dim=0,
+                ).contiguous()
+            )
         if (iteration - 1) % 250 == 0:
             log_file.write(f"[iter {iteration}] send={send_bytes/1e6:.2f}MB recv={recv_bytes/1e6:.2f}MB "f"send_entries={send_entries} recv_entries={recv_entries} \n")
 
@@ -1001,6 +1040,15 @@ def gsplat_all_to_all_communication_final(
     gpui_to_gpuj_imgk_size = gpui_to_gpuj_imgk_size.cpu().numpy().tolist()
 
     def one_all_to_all(batched_tensors, use_function_version=False):
+        if use_function_version and utils.get_args().sparse_all_to_all_backward:
+            return _SparseGradAllToAll.apply(
+                utils.DEFAULT_GROUP,
+                gpui_to_gpuj_imgk_size,
+                local_to_gpuj_camk_send_ids,
+                "gsplat_all_to_all_communication_final",
+                *batched_tensors,
+            )
+
         tensor_to_rki = []
         tensor_from_rki = []
         for i in range(utils.DEFAULT_GROUP.size()):
@@ -1022,44 +1070,33 @@ def gsplat_all_to_all_communication_final(
                 )
             )
 
-        if use_function_version and utils.get_args().sparse_all_to_all_backward:
-            tensors_per_camera = _SparseGradAllToAll.apply(
-                utils.DEFAULT_GROUP,
-                gpui_to_gpuj_imgk_size,
-                local_to_gpuj_camk_send_ids,
-                "gsplat_all_to_all_communication_final",
-                *batched_tensors,
+        if use_function_version:
+            dist_func.all_to_all(
+                output_tensor_list=tensor_from_rki,
+                input_tensor_list=tensor_to_rki,
+                group=utils.DEFAULT_GROUP,
             )
         else:
-            if (
-                use_function_version
-            ):  # FIXME: there is error if I use torch.distributed.nn.functional to replace dist_func here. So weird.
-                dist_func.all_to_all(
-                    output_tensor_list=tensor_from_rki,
-                    input_tensor_list=tensor_to_rki,
-                    group=utils.DEFAULT_GROUP,
-                )
-            else:
-                torch.distributed.all_to_all(
-                    output_tensor_list=tensor_from_rki,
-                    input_tensor_list=tensor_to_rki,
-                    group=utils.DEFAULT_GROUP,
-                )
-            # tensor_from_rki: (world_size, (all data received from all other GPUs))
-            for i in range(utils.DEFAULT_GROUP.size()):
-                # -> (world_size, num_cameras, *)
-                tensor_from_rki[i] = tensor_from_rki[i].split(
-                    gpui_to_gpuj_imgk_size[i][utils.DEFAULT_GROUP.rank()], dim=0
-                )
+            torch.distributed.all_to_all(
+                output_tensor_list=tensor_from_rki,
+                input_tensor_list=tensor_to_rki,
+                group=utils.DEFAULT_GROUP,
+            )
+        # tensor_from_rki: (world_size, (all data received from all other GPUs))
+        for i in range(utils.DEFAULT_GROUP.size()):
+            # -> (world_size, num_cameras, *)
+            tensor_from_rki[i] = tensor_from_rki[i].split(
+                gpui_to_gpuj_imgk_size[i][utils.DEFAULT_GROUP.rank()], dim=0
+            )
 
-            tensors_per_camera = []
-            for k in range(num_cameras):
-                tensors_per_camera.append(
-                    torch.cat(
-                        [tensor_from_rki[i][k] for i in range(utils.DEFAULT_GROUP.size())],
-                        dim=0,
-                    ).contiguous()
-                )
+        tensors_per_camera = []
+        for k in range(num_cameras):
+            tensors_per_camera.append(
+                torch.cat(
+                    [tensor_from_rki[i][k] for i in range(utils.DEFAULT_GROUP.size())],
+                    dim=0,
+                ).contiguous()
+            )
 
         return tensors_per_camera
 
