@@ -406,6 +406,86 @@ RenderGaussiansBackwardCUDA(
   return std::make_tuple(dL_dmeans2D, dL_dconic_opacity, dL_dcolors);
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RenderGaussiansL1LossCUDA(
+	const torch::Tensor& background,
+    const int image_height,
+    const int image_width,
+	const torch::Tensor& target,
+	torch::Tensor& means2D,
+	torch::Tensor& depths,
+	torch::Tensor& radii,
+	torch::Tensor& conic_opacity,
+	torch::Tensor& rgb,
+	const torch::Tensor& compute_locally,
+	const int target_y_offset,
+	const float loss_normalizer,
+	const float lambda_l1,
+	const float lambda_ssim,
+	const bool debug,
+	const pybind11::dict &args)
+{
+  const int P = means2D.size(0);
+  const int H = image_height;
+  const int W = image_width;
+  const int target_H = target.size(1);
+
+  auto float_opts = means2D.options().dtype(torch::kFloat32);
+
+  torch::Tensor loss = torch::zeros({}, float_opts);
+  torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, float_opts);
+  torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, float_opts);
+  torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, float_opts);
+  torch::Tensor dL_dopacity = torch::zeros({P, 1}, float_opts);
+
+  torch::Device device(torch::kCUDA);
+  torch::TensorOptions options(torch::kByte);
+  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+  std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
+  std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
+  std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+
+  if(P != 0)
+  {
+	  CudaRasterizer::Rasterizer::renderForwardL1SSIMBackward(
+		geomFunc,
+		binningFunc,
+		imgFunc,
+	    P,
+		background.contiguous().data<float>(),
+		W, H,
+		target.contiguous().data<float>(),
+		target_H,
+		target_y_offset,
+		reinterpret_cast<float2*>(means2D.contiguous().data<float>()),
+		depths.contiguous().data<float>(),
+		radii.contiguous().data<int>(),
+		reinterpret_cast<float4*>(conic_opacity.contiguous().data<float>()),
+		rgb.contiguous().data<float>(),
+		compute_locally.contiguous().data<bool>(),
+		loss_normalizer,
+		lambda_l1,
+		lambda_ssim,
+		loss.contiguous().data<float>(),
+		dL_dmeans2D.contiguous().data<float>(),
+		dL_dconic.contiguous().data<float>(),
+		dL_dopacity.contiguous().data<float>(),
+		dL_dcolors.contiguous().data<float>(),
+		debug,
+		args);
+  }
+
+  torch::Tensor dL_dconic_opacity = torch::zeros({P, 4}, float_opts);
+  dL_dconic_opacity.select(1, 0).copy_(dL_dconic.select(1, 0).select(1, 0));
+  dL_dconic_opacity.select(1, 1).copy_(dL_dconic.select(1, 0).select(1, 1));
+  dL_dconic_opacity.select(1, 2).copy_(dL_dconic.select(1, 1).select(1, 1));
+  dL_dconic_opacity.select(1, 3).copy_(dL_dopacity.select(1, 0));
+
+  return std::make_tuple(loss, dL_dmeans2D, dL_dconic_opacity, dL_dcolors);
+}
+
 /////////////////////////////// Utility tools ///////////////////////////////
 
 __global__ void getTouchedIdsBool(

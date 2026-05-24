@@ -34,6 +34,7 @@ namespace cg = cooperative_groups;
 #include "auxiliary.h"
 #include "forward.h"
 #include "backward.h"
+#include "fused_render.h"
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
@@ -953,6 +954,149 @@ void CudaRasterizer::Rasterizer::renderBackward(
 	if (zhx_time && iteration % log_interval == 1) {
 		timer.printAllTimes(iteration, world_size, global_rank, log_folder, false);
 	}
+}
+
+int CudaRasterizer::Rasterizer::renderForwardL1SSIMBackward(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	const int P,
+	const float* background,
+	const int width, int height,
+	const float* target,
+	int target_height,
+	int target_y_offset,
+	float2* means2D,
+	float* depths,
+	int* radii,
+	float4* conic_opacity,
+	float* rgb,
+	bool* compute_locally,
+	float loss_normalizer,
+	float lambda_l1,
+	float lambda_ssim,
+	float* loss,
+	float* dL_dmean2D,
+	float* dL_dconic,
+	float* dL_dopacity,
+	float* dL_dcolor,
+	bool debug,
+	const pybind11::dict &args)
+{
+	auto [global_rank, world_size, iteration, log_interval, device, zhx_debug, zhx_time, mode, dist_division_mode, log_folder] = prepareArgs(args);
+
+	MyTimerOnGPU timer;
+
+	size_t chunk_size = required<GeometryState>(P);
+	char* chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P, true);
+
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+	const int num_tiles = tile_grid.x * tile_grid.y;
+
+	size_t img_chunk_size = sizeof(uint2) * num_tiles + 128;
+	char* img_chunkptr = imageBuffer(img_chunk_size);
+	uint2* ranges;
+	obtain(img_chunkptr, ranges, num_tiles, 128);
+
+	timer.start("f10 updateTileTouched");
+	updateTileTouched <<<(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
+		P,
+		tile_grid,
+		radii,
+		means2D,
+		geomState.tiles_touched,
+		compute_locally
+	);
+	timer.stop("f10 updateTileTouched");
+
+	timer.start("f20 InclusiveSum");
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+	timer.stop("f20 InclusiveSum");
+
+	int num_rendered;
+	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+
+	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	timer.start("f30 duplicateWithKeys");
+	duplicateWithKeys << <(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >> > (
+		P,
+		means2D,
+		conic_opacity,
+		depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		compute_locally,
+		tile_grid)
+	CHECK_CUDA(, debug)
+	timer.stop("f30 duplicateWithKeys");
+
+	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+
+	timer.start("f40 SortPairs");
+	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space,
+		binningState.sorting_size,
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,
+		binningState.point_list_unsorted, binningState.point_list,
+		num_rendered, 0, 32 + bit), debug)
+	timer.stop("f40 SortPairs");
+
+	CHECK_CUDA(cudaMemset(ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+
+	timer.start("f50 identifyTileRanges");
+	if (num_rendered > 0)
+		identifyTileRanges << <(num_rendered + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >> > (
+			num_rendered,
+			binningState.point_list_keys,
+			ranges);
+	CHECK_CUDA(, debug)
+	timer.stop("f50 identifyTileRanges");
+
+	timer.start("f60 fused_render_l1_ssim_backward");
+	CHECK_CUDA(FUSED::render_l1_ssim_backward(
+		tile_grid, block,
+		ranges,
+		binningState.point_list,
+		width, height,
+		background,
+		means2D,
+		conic_opacity,
+		rgb,
+		target,
+		target_height,
+		target_y_offset,
+		loss_normalizer,
+		lambda_l1,
+		lambda_ssim,
+		compute_locally,
+		loss,
+		(float3*)dL_dmean2D,
+		(float4*)dL_dconic,
+		dL_dopacity,
+		dL_dcolor), debug)
+	timer.stop("f60 fused_render_l1_ssim_backward");
+
+	float fused_render_time = timer.elapsedMilliseconds("f60 fused_render_l1_ssim_backward", "sum");
+	args["stats_collector"]["fused_l1_ssim_render_backward_time"] = fused_render_time;
+	args["stats_collector"]["forward_render_time"] =
+		timer.elapsedMilliseconds("f40 SortPairs", "sum") +
+		timer.elapsedMilliseconds("f30 duplicateWithKeys", "sum");
+	args["stats_collector"]["backward_render_time"] = fused_render_time;
+	args["stats_collector"]["forward_loss_time"] = 0.0f;
+	args["stats_collector"]["backward_loss_time"] = 0.0f;
+
+	if (zhx_time && iteration % log_interval == 1) {
+		timer.printAllTimes(iteration, world_size, global_rank, log_folder, false);
+	}
+
+	return num_rendered;
 }
 
 __global__ void perTileBucketCount(int T, const uint2* ranges, uint32_t* bucketCount)

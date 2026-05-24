@@ -1509,11 +1509,14 @@ def gsplat_distributed_preprocess3dgs_and_all2all_final(
     return batched_screenspace_pkg
 
 
-def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
+def render_final(
+    batched_screenspace_pkg, batched_strategies, tile_size=16, batched_cameras=None
+):
     """
     Render the scene.
     """
     timers = utils.get_timers()
+    args = utils.get_args()
 
     batched_rendered_image = []
     batched_compute_locally = []
@@ -1529,7 +1532,10 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
         if timers is not None:
             timers.start("forward_compute_locally")
         compute_locally = strategy.get_compute_locally()
-        extended_compute_locally = strategy.get_extended_compute_locally()
+        use_fused_render_loss = args.use_fused_render_loss and batched_cameras is not None
+        extended_compute_locally = None
+        if not use_fused_render_loss:
+            extended_compute_locally = strategy.get_extended_compute_locally()
         if timers is not None:
             timers.stop("forward_compute_locally")
 
@@ -1562,6 +1568,33 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
             cuda_args["stats_collector"]["forward_render_time"] = 0.0
             cuda_args["stats_collector"]["backward_render_time"] = 0.0
             cuda_args["stats_collector"]["forward_loss_time"] = 0.0
+        elif use_fused_render_loss:
+            rank = strategy.gpu_ids.index(utils.GLOBAL_RANK)
+            tile_ids_l = strategy.division_pos[rank]
+            tile_ids_r = strategy.division_pos[rank + 1]
+            coverage_min_y = tile_ids_l * utils.BLOCK_Y
+            coverage_max_y = min(tile_ids_r * utils.BLOCK_Y, utils.IMG_H)
+
+            gt_image = batched_cameras[cam_id].original_image
+            if gt_image.shape[1] == rasterizer.raster_settings.image_height:
+                gt_image = gt_image[:, coverage_min_y:coverage_max_y, :]
+            gt_image = torch.clamp(gt_image / 255.0, 0.0, 1.0).contiguous()
+
+            rendered_image = rasterizer.render_gaussians_l1_loss(
+                means2D=means2D_redistributed,
+                conic_opacity=conic_opacity_redistributed,
+                rgb=rgb_redistributed,
+                depths=depths_redistributed,
+                radii=radii_redistributed,
+                target=gt_image,
+                compute_locally=compute_locally,
+                cuda_args=cuda_args,
+                target_y_offset=coverage_min_y,
+                loss_normalizer=utils.get_num_pixels() * 3,
+                lambda_l1=1.0 - args.lambda_dssim,
+                lambda_ssim=args.lambda_dssim,
+            )
+            rendered_image = {"loss": rendered_image}
         else:
             rendered_image, n_render, n_consider, n_contrib = (
                 rasterizer.render_gaussians(

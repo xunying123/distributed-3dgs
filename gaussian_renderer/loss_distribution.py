@@ -2622,6 +2622,9 @@ def batched_loss_computation(
         if image is None:  # This image is not rendered locally.
             loss = 0
             batched_losses.append([0.0, 0.0])
+        elif isinstance(image, dict) and "loss" in image:
+            loss = image["loss"]
+            batched_losses.append([loss.detach(), loss.detach() * 0.0])
         elif len(image.shape) == 0:  # This image is not rendered locally.
             loss = image * 0
             batched_losses.append([loss, 0.0])

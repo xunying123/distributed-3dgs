@@ -177,7 +177,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 mode="train",
             )
             batched_image, batched_compute_locally = render_final(
-                batched_screenspace_pkg, batched_strategies
+                batched_screenspace_pkg,
+                batched_strategies,
+                batched_cameras=batched_cameras,
             )
             batch_statistic_collector = [
                 cuda_args["stats_collector"]
@@ -216,9 +218,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 dist.all_reduce(
                     batched_losses, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP
                 )
-            batched_loss = (1.0 - args.lambda_dssim) * batched_losses[
-                :, 0
-            ] + args.lambda_dssim * (1.0 - batched_losses[:, 1])
+            if args.use_fused_render_loss:
+                batched_loss = batched_losses[:, 0]
+            else:
+                batched_loss = (1.0 - args.lambda_dssim) * batched_losses[
+                    :, 0
+                ] + args.lambda_dssim * (1.0 - batched_losses[:, 1])
             batched_loss_cpu = batched_loss.cpu().numpy()
             ema_loss_for_log = (
                 batched_loss_cpu.mean()

@@ -175,6 +175,37 @@ def render_gaussians(
         cuda_args,
     )
 
+def render_gaussians_l1_loss(
+    means2D,
+    conic_opacity,
+    rgb,
+    depths,
+    radii,
+    target,
+    compute_locally,
+    raster_settings,
+    cuda_args,
+    target_y_offset=0,
+    loss_normalizer=None,
+    lambda_l1=1.0,
+    lambda_ssim=0.0,
+):
+    return _RenderGaussiansL1Loss.apply(
+        means2D,
+        conic_opacity,
+        rgb,
+        depths,
+        radii,
+        target,
+        compute_locally,
+        raster_settings,
+        cuda_args,
+        target_y_offset,
+        loss_normalizer,
+        lambda_l1,
+        lambda_ssim,
+    )
+
 class _RenderGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -285,6 +316,82 @@ class _RenderGaussians(torch.autograd.Function):
         return grads
 
 
+class _RenderGaussiansL1Loss(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        means2D,
+        conic_opacity,
+        rgb,
+        depths,
+        radii,
+        target,
+        compute_locally,
+        raster_settings,
+        cuda_args,
+        target_y_offset,
+        loss_normalizer,
+        lambda_l1,
+        lambda_ssim,
+    ):
+        if loss_normalizer is None:
+            loss_normalizer = float(
+                raster_settings.image_height * raster_settings.image_width * 3
+            )
+        else:
+            loss_normalizer = float(loss_normalizer)
+        lambda_l1 = float(lambda_l1)
+        lambda_ssim = float(lambda_ssim)
+
+        args = (
+            raster_settings.bg,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            target,
+            means2D,
+            depths,
+            radii,
+            conic_opacity,
+            rgb,
+            compute_locally,
+            int(target_y_offset),
+            loss_normalizer,
+            lambda_l1,
+            lambda_ssim,
+            raster_settings.debug,
+            cuda_args,
+        )
+
+        loss, dL_dmeans2D, dL_dconic_opacity, dL_dcolors = (
+            _C.render_gaussians_l1_loss(*args)
+        )
+
+        ctx.save_for_backward(dL_dmeans2D, dL_dconic_opacity, dL_dcolors)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        dL_dmeans2D, dL_dconic_opacity, dL_dcolors = ctx.saved_tensors
+        if grad_loss is None:
+            grad_loss = 0.0
+
+        return (
+            (dL_dmeans2D[:, :2] * grad_loss).contiguous(),
+            (dL_dconic_opacity * grad_loss).contiguous(),
+            (dL_dcolors * grad_loss).contiguous(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 
 
 
@@ -352,6 +459,40 @@ class GaussianRasterizer(nn.Module):
             extended_compute_locally,
             raster_settings,
             cuda_args
+        )
+
+    def render_gaussians_l1_loss(
+        self,
+        means2D,
+        conic_opacity,
+        rgb,
+        depths,
+        radii,
+        target,
+        compute_locally,
+        cuda_args=None,
+        target_y_offset=0,
+        loss_normalizer=None,
+        lambda_l1=1.0,
+        lambda_ssim=0.0,
+    ):
+
+        raster_settings = self.raster_settings
+
+        return render_gaussians_l1_loss(
+            means2D,
+            conic_opacity,
+            rgb,
+            depths,
+            radii,
+            target,
+            compute_locally,
+            raster_settings,
+            cuda_args,
+            target_y_offset,
+            loss_normalizer,
+            lambda_l1,
+            lambda_ssim,
         )
 
 class _LoadImageTilesByPos(torch.autograd.Function):
