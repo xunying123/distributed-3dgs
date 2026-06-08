@@ -883,6 +883,196 @@ int CudaRasterizer::Rasterizer::renderForward(
 	return num_rendered;
 }
 
+int CudaRasterizer::Rasterizer::renderForwardL1(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	std::function<char* (size_t)> sampleBuffer,
+	const int P,
+	const float* background,
+	const int width, int height,
+	float2* means2D,
+	float* depths,
+	int* radii,
+	float4* conic_opacity,
+	float* rgb,
+	bool* render_compute_locally,
+	bool* loss_compute_locally,
+	const float* gt_image,
+	int gt_image_y_offset,
+	int gt_image_height,
+	float lambda_l1,
+	float lambda_ssim,
+	float* out_loss,
+	float* out_color,
+	float* dL_dpixels,
+	int* n_render,
+	int* n_consider,
+	int* n_contrib,
+	int* n_bucket,
+	bool debug,
+	const pybind11::dict &args)
+{
+	auto [global_rank, world_size, iteration, log_interval, device, zhx_debug, zhx_time, mode, dist_division_mode, log_folder] = prepareArgs(args);
+
+	MyTimerOnGPU timer;
+
+	size_t chunk_size = required<GeometryState>(P);
+	char* chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P, true);
+
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+	const int tile_num = tile_grid.x * tile_grid.y;
+
+	size_t img_chunk_size = required<ImageState>(width * height);
+	char* img_chunkptr = imageBuffer(img_chunk_size);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+
+	timer.start("24 updateDistributedStatLocally.updateTileTouched");
+	updateTileTouched <<<(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
+		P,
+		tile_grid,
+		radii,
+		means2D,
+		geomState.tiles_touched,
+		render_compute_locally
+	);
+	timer.stop("24 updateDistributedStatLocally.updateTileTouched");
+
+	timer.start("30 InclusiveSum");
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+	timer.stop("30 InclusiveSum");
+
+	int num_rendered = 0;
+	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+
+	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	timer.start("40 duplicateWithKeys");
+	duplicateWithKeys << <(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >> > (
+		P,
+		means2D,
+		conic_opacity,
+		depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		render_compute_locally,
+		tile_grid)
+	CHECK_CUDA(, debug)
+	timer.stop("40 duplicateWithKeys");
+
+	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+
+	timer.start("50 SortPairs");
+	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space,
+		binningState.sorting_size,
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,
+		binningState.point_list_unsorted, binningState.point_list,
+		num_rendered, 0, 32 + bit), debug)
+	timer.stop("50 SortPairs");
+
+	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+
+	timer.start("60 identifyTileRanges");
+	if (num_rendered > 0)
+		identifyTileRanges << <(num_rendered + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >> > (
+			num_rendered,
+			binningState.point_list_keys,
+			imgState.ranges);
+	CHECK_CUDA(, debug)
+	timer.stop("60 identifyTileRanges");
+
+	perTileBucketCount<<<(tile_num + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE>>>(
+		tile_num, imgState.ranges, imgState.bucket_count);
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(
+		imgState.bucket_count_scanning_space,
+		imgState.bucket_count_scan_size,
+		imgState.bucket_count,
+		imgState.bucket_offsets,
+		tile_num), debug);
+	int bucket_sum = 0;
+	if (tile_num > 0)
+		CHECK_CUDA(cudaMemcpy(&bucket_sum, imgState.bucket_offsets + tile_num - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	*n_bucket = bucket_sum;
+
+	size_t sample_chunk_size = required<SampleState>(bucket_sum);
+	char* sample_chunkptr = sampleBuffer(sample_chunk_size);
+	SampleState sampleState = SampleState::fromChunk(sample_chunkptr, bucket_sum);
+
+	CHECK_CUDA(cudaMemset(out_loss, 0, sizeof(float)), debug);
+
+	const float* feature_ptr = rgb;
+	timer.start("70 render_l1");
+	CHECK_CUDA(FORWARD::render_l1(
+		tile_grid, block,
+		imgState.ranges,
+		binningState.point_list,
+		imgState.bucket_offsets,
+		sampleState.bucket_to_tile,
+		sampleState.T,
+		sampleState.ar,
+		width, height,
+		means2D,
+		feature_ptr,
+		conic_opacity,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		imgState.max_contrib,
+		imgState.n_contrib2loss,
+		background,
+		gt_image,
+		gt_image_y_offset,
+		gt_image_height,
+		loss_compute_locally,
+		lambda_l1,
+		lambda_ssim,
+		out_loss,
+		out_color,
+		dL_dpixels), debug)
+	timer.stop("70 render_l1");
+	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHANNELS, cudaMemcpyDeviceToDevice), debug);
+
+	timer.start("81 sum_n_render");
+	get_n_render<<< (tile_num + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
+		tile_num,
+		imgState.ranges,
+		n_render
+	);
+	timer.stop("81 sum_n_render");
+	timer.start("82 sum_n_consider");
+	reduce_data_per_block<< <tile_grid, block >> > (
+		width, height,
+		imgState.n_contrib,
+		n_consider,
+		render_compute_locally
+	);
+	timer.stop("82 sum_n_consider");
+	timer.start("83 sum_n_contrib");
+	reduce_data_per_block<< <tile_grid, block >> > (
+		width, height,
+		imgState.n_contrib2loss,
+		n_contrib,
+		render_compute_locally
+	);
+	timer.stop("83 sum_n_contrib");
+
+	float forward_render_time = timer.elapsedMilliseconds("70 render_l1", "sum") + timer.elapsedMilliseconds("50 SortPairs", "sum") + timer.elapsedMilliseconds("40 duplicateWithKeys", "sum");
+	args["stats_collector"]["forward_render_time"] = forward_render_time;
+	args["stats_collector"]["forward_loss_time"] = 0.0f;
+
+	if (mode == "train" && zhx_time && iteration % log_interval == 1) {
+		timer.printAllTimes(iteration, world_size, global_rank, log_folder, false);
+	}
+
+	return num_rendered;
+}
+
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
 void CudaRasterizer::Rasterizer::renderBackward(

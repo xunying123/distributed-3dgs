@@ -133,6 +133,36 @@ namespace CudaRasterizer
 			bool debug,
 			const pybind11::dict &args);
 
+		static int renderForwardL1(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			std::function<char* (size_t)> sampleBuffer,
+			const int P,
+			const float* background,
+			const int width, int height,
+			float2* means2D,
+			float* depths,
+			int* radii,
+			float4* conic_opacity,
+			float* rgb,
+			bool* render_compute_locally,
+			bool* loss_compute_locally,
+			const float* gt_image,
+			int gt_image_y_offset,
+			int gt_image_height,
+			float lambda_l1,
+			float lambda_ssim,
+			float* out_loss,
+			float* out_color,
+			float* dL_dpixels,
+			int* n_render,
+			int* n_consider,
+			int* n_contrib,
+			int* n_bucket,
+			bool debug,
+			const pybind11::dict &args);
+
 		static void renderBackward(
 			const int P, int R, int B,
 			const float* background,

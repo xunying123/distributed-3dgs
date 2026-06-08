@@ -2625,6 +2625,9 @@ def batched_loss_computation(
         elif len(image.shape) == 0:  # This image is not rendered locally.
             loss = image * 0
             batched_losses.append([loss, 0.0])
+        elif "fused_loss" in statistic_collector:
+            loss = statistic_collector["fused_loss"]
+            batched_losses.append([loss.detach(), -1.0])
         else:
             Ll1, ssim_loss = final_system_loss_computation(
                 image, camera, compute_locally, strategy, statistic_collector

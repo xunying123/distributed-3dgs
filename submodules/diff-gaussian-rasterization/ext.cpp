@@ -19,6 +19,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("preprocess_gaussians_backward", &PreprocessGaussiansBackwardCUDA);
   m.def("get_distribution_strategy", &GetDistributionStrategyCUDA);
   m.def("render_gaussians", &RenderGaussiansCUDA);
+  m.def("render_gaussians_l1", &RenderGaussiansL1CUDA);
   m.def("render_gaussians_backward", &RenderGaussiansBackwardCUDA);
   m.def("get_local2j_ids_bool", &GetLocal2jIdsBoolCUDA);
   m.def("get_local2j_ids_bool_adjust_mode6", &GetLocal2jIdsBoolAdjustMode6CUDA);

@@ -986,6 +986,7 @@ def distributed_preprocess3dgs_and_all2all_final(
 
     if utils.DEFAULT_GROUP.size() == 1:
         batched_screenspace_pkg = {
+            "batched_viewpoint_cameras": batched_viewpoint_cameras,
             "batched_locally_preprocessed_mean2D": batched_means2D,
             "batched_locally_preprocessed_visibility_filter": [
                 radii > 0 for radii in batched_radii
@@ -1040,6 +1041,7 @@ def distributed_preprocess3dgs_and_all2all_final(
         timers.stop("forward_all_to_all_communication")
 
     batched_screenspace_pkg = {
+        "batched_viewpoint_cameras": batched_viewpoint_cameras,
         "batched_locally_preprocessed_mean2D": batched_means2D,
         "batched_locally_preprocessed_visibility_filter": [
             radii > 0 for radii in batched_radii
@@ -1238,6 +1240,8 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
     Render the scene.
     """
     timers = utils.get_timers()
+    args = utils.get_args()
+    use_fused_local_loss = "batched_viewpoint_cameras" in batched_screenspace_pkg
 
     batched_rendered_image = []
     batched_compute_locally = []
@@ -1286,7 +1290,38 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
             cuda_args["stats_collector"]["forward_render_time"] = 0.0
             cuda_args["stats_collector"]["backward_render_time"] = 0.0
             cuda_args["stats_collector"]["forward_loss_time"] = 0.0
+            cuda_args["stats_collector"].pop("fused_loss", None)
+        elif use_fused_local_loss and cuda_args["mode"] == "train":
+            viewpoint_camera = batched_screenspace_pkg["batched_viewpoint_cameras"][
+                cam_id
+            ]
+            rank = strategy.gpu_ids.index(utils.GLOBAL_RANK)
+            gt_image_y_offset = strategy.division_pos[rank] * utils.BLOCK_Y
+            gt_image = torch.clamp(
+                viewpoint_camera.original_image / 255.0, 0.0, 1.0
+            ).contiguous()
+            loss_scale = 1.0 / float(utils.get_num_pixels() * 3)
+            lambda_l1 = (1.0 - args.lambda_dssim) * loss_scale
+            lambda_ssim = args.lambda_dssim * loss_scale
+            rendered_image, fused_loss, n_render, n_consider, n_contrib = (
+                rasterizer.render_gaussians_l1(
+                    means2D=means2D_redistributed,
+                    conic_opacity=conic_opacity_redistributed,
+                    rgb=rgb_redistributed,
+                    depths=depths_redistributed,
+                    radii=radii_redistributed,
+                    compute_locally=compute_locally,
+                    extended_compute_locally=extended_compute_locally,
+                    gt_image=gt_image,
+                    gt_image_y_offset=gt_image_y_offset,
+                    lambda_l1=lambda_l1,
+                    lambda_ssim=lambda_ssim,
+                    cuda_args=cuda_args,
+                )
+            )
+            cuda_args["stats_collector"]["fused_loss"] = fused_loss
         else:
+            cuda_args["stats_collector"].pop("fused_loss", None)
             rendered_image, n_render, n_consider, n_contrib = (
                 rasterizer.render_gaussians(
                     means2D=means2D_redistributed,

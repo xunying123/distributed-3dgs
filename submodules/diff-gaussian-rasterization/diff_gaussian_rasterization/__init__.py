@@ -175,6 +175,38 @@ def render_gaussians(
         cuda_args,
     )
 
+
+def render_gaussians_l1(
+    means2D,
+    conic_opacity,
+    rgb,
+    depths,
+    radii,
+    compute_locally,
+    extended_compute_locally,
+    gt_image,
+    gt_image_y_offset,
+    lambda_l1,
+    lambda_ssim,
+    raster_settings,
+    cuda_args,
+):
+    return _RenderGaussiansL1.apply(
+        means2D,
+        conic_opacity,
+        rgb,
+        depths,
+        radii,
+        compute_locally,
+        extended_compute_locally,
+        gt_image,
+        gt_image_y_offset,
+        lambda_l1,
+        lambda_ssim,
+        raster_settings,
+        cuda_args,
+    )
+
 class _RenderGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -285,6 +317,104 @@ class _RenderGaussians(torch.autograd.Function):
         return grads
 
 
+class _RenderGaussiansL1(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        means2D,
+        conic_opacity,
+        rgb,
+        depths,
+        radii,
+        compute_locally,
+        extended_compute_locally,
+        gt_image,
+        gt_image_y_offset,
+        lambda_l1,
+        lambda_ssim,
+        raster_settings,
+        cuda_args,
+    ):
+        args = (
+            raster_settings.bg,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            means2D,
+            depths,
+            radii,
+            conic_opacity,
+            rgb,
+            extended_compute_locally if cuda_args["avoid_pixel_all2all"] else compute_locally,
+            compute_locally,
+            gt_image,
+            int(gt_image_y_offset),
+            float(lambda_l1),
+            float(lambda_ssim),
+            raster_settings.debug,
+            cuda_args
+        )
+
+        num_rendered, num_buckets, loss, color, dL_dpixels, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = _C.render_gaussians_l1(*args)
+
+        ctx.raster_settings = raster_settings
+        ctx.cuda_args = cuda_args
+        ctx.num_rendered = num_rendered
+        ctx.num_buckets = num_buckets
+        ctx.save_for_backward(means2D, conic_opacity, rgb, dL_dpixels, geomBuffer, binningBuffer, imgBuffer, sampleBuffer)
+        ctx.mark_non_differentiable(n_render, n_consider, n_contrib)
+
+        return color, loss, n_render, n_consider, n_contrib
+
+    @staticmethod
+    def backward(ctx, grad_color, grad_loss, grad_n_render, grad_n_consider, grad_n_contrib):
+        num_rendered = ctx.num_rendered
+        num_buckets = ctx.num_buckets
+        raster_settings = ctx.raster_settings
+        cuda_args = ctx.cuda_args
+        means2D, conic_opacity, rgb, dL_dpixels, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = ctx.saved_tensors
+
+        grad_pixels = None
+        if grad_loss is not None:
+            grad_pixels = dL_dpixels * grad_loss
+        if grad_color is not None:
+            grad_pixels = grad_color if grad_pixels is None else grad_pixels + grad_color
+        if grad_pixels is None:
+            grad_pixels = torch.zeros_like(dL_dpixels)
+
+        args = (raster_settings.bg,
+                num_rendered,
+                num_buckets,
+                geomBuffer,
+                binningBuffer,
+                imgBuffer,
+                sampleBuffer,
+                grad_pixels.contiguous(),
+                means2D,
+                conic_opacity,
+                rgb,
+                raster_settings.debug,
+                cuda_args)
+
+        dL_dmeans2D, dL_dconic_opacity, dL_dcolors = _C.render_gaussians_backward(*args)
+        dL_dmeans2D = dL_dmeans2D[:,:2]
+
+        return (
+            dL_dmeans2D.contiguous(),
+            dL_dconic_opacity.contiguous(),
+            dL_dcolors.contiguous(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+
+
 
 
 
@@ -350,6 +480,26 @@ class GaussianRasterizer(nn.Module):
             radii,
             compute_locally,
             extended_compute_locally,
+            raster_settings,
+            cuda_args
+        )
+
+    def render_gaussians_l1(self, means2D, conic_opacity, rgb, depths, radii, compute_locally, extended_compute_locally, gt_image, gt_image_y_offset, lambda_l1, lambda_ssim, cuda_args = None):
+
+        raster_settings = self.raster_settings
+
+        return render_gaussians_l1(
+            means2D,
+            conic_opacity,
+            rgb,
+            depths,
+            radii,
+            compute_locally,
+            extended_compute_locally,
+            gt_image,
+            gt_image_y_offset,
+            lambda_l1,
+            lambda_ssim,
             raster_settings,
             cuda_args
         )
