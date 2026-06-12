@@ -1291,7 +1291,11 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
             cuda_args["stats_collector"]["backward_render_time"] = 0.0
             cuda_args["stats_collector"]["forward_loss_time"] = 0.0
             cuda_args["stats_collector"].pop("fused_loss", None)
-        elif use_fused_local_loss and cuda_args["mode"] == "train":
+        elif (
+            use_fused_local_loss
+            and cuda_args["mode"] == "train"
+            and getattr(args, "enable_fused_render_loss", False)
+        ):
             viewpoint_camera = batched_screenspace_pkg["batched_viewpoint_cameras"][
                 cam_id
             ]
