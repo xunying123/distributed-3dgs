@@ -29,6 +29,9 @@ import torch.distributed as dist
 from densification import densification, gsplat_densification
 
 
+START_NSIGHT_PROFILE_AFTER_ITERATION = 99900
+
+
 def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     # Init auxiliary tools
@@ -92,6 +95,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     num_trained_batches = 0
 
     ema_loss_for_log = 0
+    nsight_profile_started = False
     for iteration in range(
         start_from_this_iteration, opt_args.iterations + 1, args.bsz
     ):
@@ -103,7 +107,16 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         gaussians.update_learning_rate(iteration)
         num_trained_batches += 1
         timers.clear()
-        if args.nsys_profile:
+
+        if (
+            not nsight_profile_started
+            and iteration >= START_NSIGHT_PROFILE_AFTER_ITERATION
+        ):
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
+            nsight_profile_started = True
+
+        if nsight_profile_started:
             nvtx.range_push(f"iteration[{iteration},{iteration+args.bsz})")
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if utils.check_update_at_this_iter(iteration, args.bsz, 1000, 0):
@@ -353,13 +366,17 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         ) in batched_cameras:  # Release memory of locally rendered original_image
             viewpoint_cam.original_image = None
             viewpoint_cam.unload_image()
-        if args.nsys_profile:
+        if nsight_profile_started:
             nvtx.range_pop()
         if utils.check_enable_python_timer():
             timers.printTimers(iteration, mode="sum")
         log_file.flush()
 
     # Finish training
+    if nsight_profile_started:
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+
     if opt_args.iterations not in args.save_iterations:
         end2end_timers.print_time(log_file, opt_args.iterations)
     log_file.write(

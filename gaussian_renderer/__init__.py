@@ -11,6 +11,7 @@
 
 import torch
 import math
+from contextlib import contextmanager
 from diff_gaussian_rasterization import (
     GaussianRasterizationSettings,
     GaussianRasterizer,
@@ -26,6 +27,45 @@ from gsplat import (
 from scene.gaussian_model import GaussianModel
 import utils.general_utils as utils
 import torch.distributed.nn.functional as dist_func
+
+
+@contextmanager
+def _nvtx_range(name):
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
+
+
+def _register_all_to_all_backward_nvtx(output_tensors, input_tensors, name):
+    input_tensors = [t for t in input_tensors if t.requires_grad]
+    output_tensors = [t for t in output_tensors if t.requires_grad]
+    if not input_tensors or not output_tensors or not torch.cuda.is_available():
+        return
+
+    state = {"active": False, "remaining": len(input_tensors)}
+
+    def start_backward_range(grad):
+        if not state["active"]:
+            torch.cuda.nvtx.range_push(name)
+            state["active"] = True
+        return grad
+
+    def stop_backward_range(grad):
+        if state["active"]:
+            state["remaining"] -= 1
+            if state["remaining"] == 0:
+                torch.cuda.nvtx.range_pop()
+        return grad
+
+    for tensor in output_tensors:
+        tensor.register_hook(start_backward_range)
+    for tensor in input_tensors:
+        tensor.register_hook(stop_backward_range)
 
 
 def get_cuda_args(strategy, mode="train"):  # "test"
@@ -201,12 +241,15 @@ def all_to_all_communication(
         for j in range(utils.MP_GROUP.size()):
             local2j_send_size.append(len(batched_local2j_ids[i][j]))
     local2j_send_size = torch.tensor(local2j_send_size, dtype=torch.int, device="cuda")
-    torch.distributed.all_gather_into_tensor(
-        i2j_send_size, local2j_send_size, group=utils.DEFAULT_GROUP
-    )
+    with _nvtx_range("forward.size_all_gather"):
+        torch.distributed.all_gather_into_tensor(
+            i2j_send_size, local2j_send_size, group=utils.DEFAULT_GROUP
+        )
     i2j_send_size = i2j_send_size.cpu().numpy().tolist()
 
-    def one_all_to_all(batched_tensors, use_function_version=False):
+    def one_all_to_all(
+        batched_tensors, use_function_version=False, nvtx_name="all_to_all"
+    ):
         tensor_to_rki = []
         tensor_from_rki = []
         for d_i in range(utils.DP_GROUP.size()):
@@ -225,17 +268,24 @@ def all_to_all_communication(
                 )
 
         if use_function_version:
-            dist_func.all_to_all(
-                output_tensor_list=tensor_from_rki,
-                input_tensor_list=tensor_to_rki,
-                group=utils.DEFAULT_GROUP,
-            )  # The function version could naturally enable communication during backward.
-        else:
-            torch.distributed.all_to_all(
-                output_tensor_list=tensor_from_rki,
-                input_tensor_list=tensor_to_rki,
-                group=utils.DEFAULT_GROUP,
+            with _nvtx_range(f"forward.{nvtx_name}"):
+                functional_outputs = dist_func.all_to_all(
+                    output_tensor_list=tensor_from_rki,
+                    input_tensor_list=tensor_to_rki,
+                    group=utils.DEFAULT_GROUP,
+                )  # The function version could naturally enable communication during backward.
+            if functional_outputs is not None:
+                tensor_from_rki = list(functional_outputs)
+            _register_all_to_all_backward_nvtx(
+                tensor_from_rki, tensor_to_rki, f"backward.{nvtx_name}"
             )
+        else:
+            with _nvtx_range(f"forward.{nvtx_name}"):
+                torch.distributed.all_to_all(
+                    output_tensor_list=tensor_from_rki,
+                    input_tensor_list=tensor_to_rki,
+                    group=utils.DEFAULT_GROUP,
+                )
         return torch.cat(tensor_from_rki, dim=0).contiguous()
 
     # Merge means2D, rgb, conic_opacity into one functional all-to-all communication call.
@@ -257,13 +307,17 @@ def all_to_all_communication(
         )
 
     params_redistributed = one_all_to_all(
-        batched_catted_screenspace_states, use_function_version=True
+        batched_catted_screenspace_states,
+        use_function_version=True,
+        nvtx_name="params",
     )
     means2D_redistributed, rgb_redistributed, conic_opacity_redistributed = torch.split(
         params_redistributed, [mean2d_dim1, rgb_dim1, conic_opacity_dim1], dim=1
     )
     radii_depth_redistributed = one_all_to_all(
-        batched_catted_screenspace_auxiliary_states, use_function_version=False
+        batched_catted_screenspace_auxiliary_states,
+        use_function_version=False,
+        nvtx_name="radii_depth",
     )
     radii_redistributed, depths_redistributed = torch.split(
         radii_depth_redistributed, [1, 1], dim=1
@@ -581,14 +635,17 @@ def all_to_all_communication_final(
     local_to_gpuj_camk_size_tensor = torch.tensor(
         local_to_gpuj_camk_size, dtype=torch.int, device="cuda"
     )
-    torch.distributed.all_gather_into_tensor(
-        gpui_to_gpuj_imgk_size,
-        local_to_gpuj_camk_size_tensor,
-        group=utils.DEFAULT_GROUP,
-    )
+    with _nvtx_range("forward.size_all_gather"):
+        torch.distributed.all_gather_into_tensor(
+            gpui_to_gpuj_imgk_size,
+            local_to_gpuj_camk_size_tensor,
+            group=utils.DEFAULT_GROUP,
+        )
     gpui_to_gpuj_imgk_size = gpui_to_gpuj_imgk_size.cpu().numpy().tolist()
 
-    def one_all_to_all(batched_tensors, use_function_version=False):
+    def one_all_to_all(
+        batched_tensors, use_function_version=False, nvtx_name="all_to_all"
+    ):
         tensor_to_rki = []
         tensor_from_rki = []
         for i in range(utils.DEFAULT_GROUP.size()):
@@ -617,17 +674,24 @@ def all_to_all_communication_final(
         if (
             use_function_version
         ):  # FIXME: there is error if I use torch.distributed.nn.functional to replace dist_func here. So weird.
-            dist_func.all_to_all(
-                output_tensor_list=tensor_from_rki,
-                input_tensor_list=tensor_to_rki,
-                group=utils.DEFAULT_GROUP,
-            )  # The function version could naturally enable communication during backward.
-        else:
-            torch.distributed.all_to_all(
-                output_tensor_list=tensor_from_rki,
-                input_tensor_list=tensor_to_rki,
-                group=utils.DEFAULT_GROUP,
+            with _nvtx_range(f"forward.{nvtx_name}"):
+                functional_outputs = dist_func.all_to_all(
+                    output_tensor_list=tensor_from_rki,
+                    input_tensor_list=tensor_to_rki,
+                    group=utils.DEFAULT_GROUP,
+                )  # The function version could naturally enable communication during backward.
+            if functional_outputs is not None:
+                tensor_from_rki = list(functional_outputs)
+            _register_all_to_all_backward_nvtx(
+                tensor_from_rki, tensor_to_rki, f"backward.{nvtx_name}"
             )
+        else:
+            with _nvtx_range(f"forward.{nvtx_name}"):
+                torch.distributed.all_to_all(
+                    output_tensor_list=tensor_from_rki,
+                    input_tensor_list=tensor_to_rki,
+                    group=utils.DEFAULT_GROUP,
+                )
 
         # tensor_from_rki: (world_size, (all data received from all other GPUs))
         for i in range(utils.DEFAULT_GROUP.size()):
@@ -674,7 +738,9 @@ def all_to_all_communication_final(
     #     print(f"[iter {iteration}] [rank {r}] local_kept={local_kept} external_send={external_send} external_recv={external_recv}")
 
     batched_params_redistributed = one_all_to_all(
-        batched_catted_screenspace_states, use_function_version=True
+        batched_catted_screenspace_states,
+        use_function_version=True,
+        nvtx_name="params",
     )
     batched_means2D_redistributed = []
     batched_rgb_redistributed = []
@@ -692,7 +758,9 @@ def all_to_all_communication_final(
         batched_conic_opacity_redistributed.append(conic_opacity_redistributed)
 
     batched_radii_depth_redistributed = one_all_to_all(
-        batched_catted_screenspace_auxiliary_states, use_function_version=False
+        batched_catted_screenspace_auxiliary_states,
+        use_function_version=False,
+        nvtx_name="radii_depth",
     )
     batched_radii_redistributed = []
     batched_depths_redistributed = []
@@ -762,14 +830,17 @@ def gsplat_all_to_all_communication_final(
     local_to_gpuj_camk_size_tensor = torch.tensor(
         local_to_gpuj_camk_size, dtype=torch.int, device="cuda"
     )
-    torch.distributed.all_gather_into_tensor(
-        gpui_to_gpuj_imgk_size,
-        local_to_gpuj_camk_size_tensor,
-        group=utils.DEFAULT_GROUP,
-    )
+    with _nvtx_range("forward.size_all_gather"):
+        torch.distributed.all_gather_into_tensor(
+            gpui_to_gpuj_imgk_size,
+            local_to_gpuj_camk_size_tensor,
+            group=utils.DEFAULT_GROUP,
+        )
     gpui_to_gpuj_imgk_size = gpui_to_gpuj_imgk_size.cpu().numpy().tolist()
 
-    def one_all_to_all(batched_tensors, use_function_version=False):
+    def one_all_to_all(
+        batched_tensors, use_function_version=False, nvtx_name="all_to_all"
+    ):
         tensor_to_rki = []
         tensor_from_rki = []
         for i in range(utils.DEFAULT_GROUP.size()):
@@ -794,17 +865,24 @@ def gsplat_all_to_all_communication_final(
         if (
             use_function_version
         ):  # FIXME: there is error if I use torch.distributed.nn.functional to replace dist_func here. So weird.
-            dist_func.all_to_all(
-                output_tensor_list=tensor_from_rki,
-                input_tensor_list=tensor_to_rki,
-                group=utils.DEFAULT_GROUP,
-            )  # The function version could naturally enable communication during backward.
-        else:
-            torch.distributed.all_to_all(
-                output_tensor_list=tensor_from_rki,
-                input_tensor_list=tensor_to_rki,
-                group=utils.DEFAULT_GROUP,
+            with _nvtx_range(f"forward.{nvtx_name}"):
+                functional_outputs = dist_func.all_to_all(
+                    output_tensor_list=tensor_from_rki,
+                    input_tensor_list=tensor_to_rki,
+                    group=utils.DEFAULT_GROUP,
+                )  # The function version could naturally enable communication during backward.
+            if functional_outputs is not None:
+                tensor_from_rki = list(functional_outputs)
+            _register_all_to_all_backward_nvtx(
+                tensor_from_rki, tensor_to_rki, f"backward.{nvtx_name}"
             )
+        else:
+            with _nvtx_range(f"forward.{nvtx_name}"):
+                torch.distributed.all_to_all(
+                    output_tensor_list=tensor_from_rki,
+                    input_tensor_list=tensor_to_rki,
+                    group=utils.DEFAULT_GROUP,
+                )
 
         # tensor_from_rki: (world_size, (all data received from all other GPUs))
         for i in range(utils.DEFAULT_GROUP.size()):
@@ -843,7 +921,9 @@ def gsplat_all_to_all_communication_final(
     ).contiguous()
 
     batched_params_redistributed = one_all_to_all(
-        batched_catted_screenspace_states, use_function_version=True
+        batched_catted_screenspace_states,
+        use_function_version=True,
+        nvtx_name="params",
     )
 
     batched_means2D_redistributed = []
@@ -868,7 +948,9 @@ def gsplat_all_to_all_communication_final(
         batched_opacities_redistributed.append(opacity_redistributed)
 
     batched_radii_depth_redistributed = one_all_to_all(
-        batched_catted_screenspace_auxiliary_states, use_function_version=False
+        batched_catted_screenspace_auxiliary_states,
+        use_function_version=False,
+        nvtx_name="radii_depth",
     )
 
     batched_radiis_redistributed = []

@@ -849,15 +849,64 @@ class DivisionStrategyHistoryFinal:
         return self.history
 
 
+def _log_final_task_assignment(
+    batched_cameras,
+    gpuid2tasks,
+    division_pos,
+    local_sampling,
+):
+    args = utils.get_args()
+    iteration = utils.get_cur_iter()
+    log_file = utils.get_log_file()
+    if (
+        args is None
+        or iteration is None
+        or log_file is None
+        or utils.GLOBAL_RANK != 0
+        or not utils.check_update_at_this_iter(iteration, args.bsz, args.log_interval, 1)
+    ):
+        return
+
+    tile_x = utils.TILE_X
+    tile_y = utils.TILE_Y
+    log_file.write(
+        f"[iter {iteration}] [task_assignment] "
+        f"local_sampling={local_sampling} "
+        f"bsz={len(batched_cameras)} "
+        f"tile_grid=({tile_y},{tile_x}) "
+        f"division_pos={division_pos}\n"
+    )
+    for gpu_id, tasks in enumerate(gpuid2tasks):
+        total_tile_rows = sum(tile_r - tile_l for _, tile_l, tile_r in tasks)
+        total_tiles = total_tile_rows * tile_x
+        task_desc = []
+        for camera_idx, tile_l, tile_r in tasks:
+            camera = batched_cameras[camera_idx]
+            camera_uid = getattr(camera, "uid", camera_idx)
+            tile_rows = tile_r - tile_l
+            task_desc.append(
+                f"cam={camera_idx}/uid={camera_uid}:rows=[{tile_l},{tile_r})"
+                f":tile_rows={tile_rows}:tiles={tile_rows * tile_x}"
+            )
+        log_file.write(
+            f"[iter {iteration}] [task_assignment] gpu={gpu_id} "
+            f"num_tasks={len(tasks)} total_tile_rows={total_tile_rows} "
+            f"total_tiles={total_tiles} tasks={';'.join(task_desc)}\n"
+        )
+    log_file.flush()
+
+
 def start_strategy_final(batched_cameras, strategy_history):
     args = utils.get_args()
 
     n_tiles_per_image = utils.TILE_Y
     total_tiles = n_tiles_per_image * len(batched_cameras)
+    world_size = utils.DEFAULT_GROUP.size()
+    division_pos = None
 
     if args.local_sampling:
         batched_strategies = []
-        gpuid2tasks = [[] for _ in range(utils.DEFAULT_GROUP.size())]
+        gpuid2tasks = [[] for _ in range(world_size)]
         bsz_per_gpu = args.bsz // utils.WORLD_SIZE
         for idx, camera in enumerate(batched_cameras):
             gpu_id = idx // bsz_per_gpu
@@ -884,7 +933,7 @@ def start_strategy_final(batched_cameras, strategy_history):
         )  # batch_size * tile_y
 
         division_pos = division_pos_heuristic(
-            catted_accum_heuristic, total_tiles, utils.DEFAULT_GROUP.size(), right=True
+            catted_accum_heuristic, total_tiles, world_size, right=True
         )
         # slightly adjust the division_pos to avoid redundant kernel launch overheads.
         for i in range(1, len(division_pos) - 1):
@@ -907,14 +956,14 @@ def start_strategy_final(batched_cameras, strategy_history):
 
         batched_strategies = []
         gpuid2tasks = [
-            [] for _ in range(utils.DEFAULT_GROUP.size())
+            [] for _ in range(world_size)
         ]  # map from gpuid to a list of tasks (camera_id, tile_l, tile_r) it should do.
         for idx, camera in enumerate(batched_cameras):
             offset = idx * n_tiles_per_image
 
             gpu_for_this_camera = []
             gpu_for_this_camera_tilelr = []
-            for gpu_id in range(utils.DEFAULT_GROUP.size()):
+            for gpu_id in range(world_size):
                 gpu_tile_l, gpu_tile_r = division_pos[gpu_id], division_pos[gpu_id + 1]
                 if gpu_tile_r <= offset or offset + n_tiles_per_image <= gpu_tile_l:
                     continue
@@ -938,6 +987,12 @@ def start_strategy_final(batched_cameras, strategy_history):
                 gpu_for_this_camera_tilelr,
             )
             batched_strategies.append(strategy)
+    _log_final_task_assignment(
+        batched_cameras,
+        gpuid2tasks,
+        division_pos,
+        args.local_sampling,
+    )
     return batched_strategies, gpuid2tasks
 
 
