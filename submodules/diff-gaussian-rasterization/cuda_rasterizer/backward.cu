@@ -693,8 +693,6 @@ renderCUDA(
 				continue;
 
 			const float G = exp(power);
-			if (con_o.w * G > 0.99f)
-				continue;
 			const float alpha = min(0.99f, con_o.w * G);
 			if (alpha < 1.0f / 255.0f)
 				continue;
@@ -818,7 +816,42 @@ void BACKWARD::preprocess(
 }
 
 void BACKWARD::render(
-	const dim3 grid, dim3 block,
+	const dim3 grid, const dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	const float* bg_color,
+	const float2* means2D,
+	const float4* conic_opacity,
+	const float* colors,
+	const float* final_Ts,
+	const uint32_t* n_contrib,
+	const bool* compute_locally,
+	const float* dL_dpixels,
+	float3* dL_dmean2D,
+	float4* dL_dconic2D,
+	float* dL_dopacity,
+	float* dL_dcolors)
+{
+	renderCUDA<NUM_CHANNELS><<<grid, block>>>(
+		ranges,
+		point_list,
+		W, H,
+		bg_color,
+		means2D,
+		conic_opacity,
+		colors,
+		final_Ts,
+		n_contrib,
+		compute_locally,
+		dL_dpixels,
+		dL_dmean2D,
+		dL_dconic2D,
+		dL_dopacity,
+		dL_dcolors);
+}
+
+void BACKWARD::renderPerGaussian(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H, int R, int B,
@@ -864,6 +897,5 @@ void BACKWARD::render(
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
-		);
+		dL_dcolors);
 }

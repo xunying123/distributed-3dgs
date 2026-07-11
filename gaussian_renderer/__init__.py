@@ -98,6 +98,7 @@ def get_cuda_args(strategy, mode="train"):  # "test"
         "zhx_time": str(args.zhx_time),
         "dist_global_strategy": strategy.get_global_strategy_str(),
         "avoid_pixel_all2all": avoid_pixel_all2all,
+        "backward_backend": args.backward_backend,
         "stats_collector": {},
     }
     return cuda_args
@@ -588,6 +589,7 @@ def get_cuda_args_final(strategy, mode="train"):
         "zhx_debug": str(args.zhx_debug),
         "zhx_time": str(args.zhx_time),
         "avoid_pixel_all2all": False,
+        "backward_backend": args.backward_backend,
         "stats_collector": {},
     }
     return cuda_args

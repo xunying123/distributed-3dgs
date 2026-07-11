@@ -432,13 +432,12 @@ RenderGaussiansL1CUDA(
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansBackwardCUDA(
- 	const torch::Tensor& background,
+	const torch::Tensor& background,
 	const int R,
-	const int B,
 	const torch::Tensor& geomBuffer,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const torch::Tensor& sampleBuffer,
+	const torch::Tensor& compute_locally,
     const torch::Tensor& dL_dout_color,
 	const torch::Tensor& means2D,// (P, 2)
 	const torch::Tensor& conic_opacity,
@@ -455,16 +454,16 @@ RenderGaussiansBackwardCUDA(
   torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means2D.options());//The requires_grad property for the gradient tensor is typically False
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means2D.options());
 
-  if(P != 0)
-  {
+	if(P != 0)
+	{
 	  CudaRasterizer::Rasterizer::renderBackward(
-		P, R, B,
+		P, R,
 		background.contiguous().data<float>(),
 		W, H,//rasterization settings.  
 		reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 		reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 		reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
-		reinterpret_cast<char*>(sampleBuffer.contiguous().data_ptr()),//buffer that contains intermedia results
+		compute_locally.contiguous().data<bool>(),
 		dL_dout_color.contiguous().data<float>(),//gradient of output
 		dL_dmeans2D.contiguous().data<float>(),
 		dL_dconic.contiguous().data<float>(),
@@ -489,6 +488,62 @@ RenderGaussiansBackwardCUDA(
   
   //TODO: in pytorch, when the reference to a tensor decreases to 0, the memory will be freed.
   //But what will happen to libtorch?
+	return std::make_tuple(dL_dmeans2D, dL_dconic_opacity, dL_dcolors);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+RenderGaussiansBackwardPerGaussianCUDA(
+	const torch::Tensor& background,
+	const int R,
+	const int B,
+	const torch::Tensor& geomBuffer,
+	const torch::Tensor& binningBuffer,
+	const torch::Tensor& imageBuffer,
+	const torch::Tensor& sampleBuffer,
+    const torch::Tensor& dL_dout_color,
+	const torch::Tensor& means2D,
+	const torch::Tensor& conic_opacity,
+	const torch::Tensor& rgb,
+	const bool debug,
+	const pybind11::dict &args)
+{
+  const int P = means2D.size(0);
+  const int H = dL_dout_color.size(1);
+  const int W = dL_dout_color.size(2);
+
+  torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means2D.options());
+  torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means2D.options());
+  torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means2D.options());
+  torch::Tensor dL_dopacity = torch::zeros({P, 1}, means2D.options());
+
+  if(P != 0)
+  {
+	  CudaRasterizer::Rasterizer::renderBackwardPerGaussian(
+		P, R, B,
+		background.contiguous().data<float>(),
+		W, H,
+		reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
+		reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
+		reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
+		reinterpret_cast<char*>(sampleBuffer.contiguous().data_ptr()),
+		dL_dout_color.contiguous().data<float>(),
+		dL_dmeans2D.contiguous().data<float>(),
+		dL_dconic.contiguous().data<float>(),
+		dL_dopacity.contiguous().data<float>(),
+		dL_dcolors.contiguous().data<float>(),
+		reinterpret_cast<float2*>(means2D.contiguous().data<float>()),
+		reinterpret_cast<float4*>(conic_opacity.contiguous().data<float>()),
+		rgb.contiguous().data<float>(),
+		debug,
+		args);
+  }
+
+  torch::Tensor dL_dconic_opacity = torch::zeros({P, 4}, means2D.options());
+  dL_dconic_opacity.select(1, 0).copy_(dL_dconic.select(1, 0).select(1, 0));
+  dL_dconic_opacity.select(1, 1).copy_(dL_dconic.select(1, 0).select(1, 1));
+  dL_dconic_opacity.select(1, 2).copy_(dL_dconic.select(1, 1).select(1, 1));
+  dL_dconic_opacity.select(1, 3).copy_(dL_dopacity.select(1, 0));
+
   return std::make_tuple(dL_dmeans2D, dL_dconic_opacity, dL_dcolors);
 }
 

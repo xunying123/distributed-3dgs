@@ -1076,13 +1076,13 @@ int CudaRasterizer::Rasterizer::renderForwardL1(
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
 void CudaRasterizer::Rasterizer::renderBackward(
-	const int P, int R, int B,
+	const int P, int R,
 	const float* background,
 	const int width, int height,//rasterization settings. 
 	char* geom_buffer,
 	char* binning_buffer,
 	char* img_buffer,
-	char* sample_buffer,
+	const bool* compute_locally,
 	const float* dL_dpix,//gradient of output
 	float* dL_dmean2D,//(P, 3)
 	float* dL_dconic,
@@ -1100,7 +1100,6 @@ void CudaRasterizer::Rasterizer::renderBackward(
 
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
-	SampleState sampleState = SampleState::fromChunk(sample_buffer, B);
 
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
@@ -1113,6 +1112,62 @@ void CudaRasterizer::Rasterizer::renderBackward(
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		background,
+		means2D,
+		conic_opacity,
+		color_ptr,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		compute_locally,
+		dL_dpix,
+		(float3*)dL_dmean2D,
+		(float4*)dL_dconic,
+		dL_dopacity,
+		dL_dcolor), debug)
+	timer.stop("b10 render");
+
+	float backward_render_time = timer.elapsedMilliseconds("b10 render", "sum");
+	// save backward_render_time in args["stats_collector"] which is a python::dict. Then it could be sent back to python.
+	args["stats_collector"]["backward_render_time"] = backward_render_time;
+
+	// Print out timing information
+	if (zhx_time && iteration % log_interval == 1) {
+		timer.printAllTimes(iteration, world_size, global_rank, log_folder, false);
+	}
+}
+
+void CudaRasterizer::Rasterizer::renderBackwardPerGaussian(
+	const int P, int R, int B,
+	const float* background,
+	const int width, int height,
+	char* geom_buffer,
+	char* binning_buffer,
+	char* img_buffer,
+	char* sample_buffer,
+	const float* dL_dpix,
+	float* dL_dmean2D,
+	float* dL_dconic,
+	float* dL_dopacity,
+	float* dL_dcolor,
+	const float2* means2D,
+	const float4* conic_opacity,
+	const float* rgb,
+	bool debug,
+	const pybind11::dict &args)
+{
+	auto [global_rank, world_size, iteration, log_interval, device, zhx_debug, zhx_time, mode, dist_division_mode, log_folder] = prepareArgs(args);
+
+	MyTimerOnGPU timer;
+	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
+	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
+	SampleState sampleState = SampleState::fromChunk(sample_buffer, B);
+
+	const float* color_ptr = rgb;
+	timer.start("b10 render");
+	CHECK_CUDA(BACKWARD::renderPerGaussian(
 		imgState.ranges,
 		binningState.point_list,
 		width, height, R, B,
@@ -1135,11 +1190,7 @@ void CudaRasterizer::Rasterizer::renderBackward(
 		dL_dcolor), debug)
 	timer.stop("b10 render");
 
-	float backward_render_time = timer.elapsedMilliseconds("b10 render", "sum");
-	// save backward_render_time in args["stats_collector"] which is a python::dict. Then it could be sent back to python.
-	args["stats_collector"]["backward_render_time"] = backward_render_time;
-	
-	// Print out timing information
+	args["stats_collector"]["backward_render_time"] = timer.elapsedMilliseconds("b10 render", "sum");
 	if (zhx_time && iteration % log_interval == 1) {
 		timer.printAllTimes(iteration, world_size, global_rank, log_folder, false);
 	}

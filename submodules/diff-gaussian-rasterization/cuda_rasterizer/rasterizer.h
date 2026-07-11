@@ -164,13 +164,13 @@ namespace CudaRasterizer
 			const pybind11::dict &args);
 
 		static void renderBackward(
-			const int P, int R, int B,
+			const int P, int R,
 			const float* background,
 			const int width, int height,//rasterization settings. 
 			char* geom_buffer,
 			char* binning_buffer,
 			char* img_buffer,//buffer that contains intermedia results
-			char* sample_buffer,
+			const bool* compute_locally,
 			const float* dL_dpix,//gradient of output
 			float* dL_dmean2D,
 			float* dL_dconic,
@@ -179,6 +179,25 @@ namespace CudaRasterizer
 			const float2* means2D,
 			const float4* conic_opacity,
 			const float* rgb,//inputs
+			bool debug,
+			const pybind11::dict &args);
+
+		static void renderBackwardPerGaussian(
+			const int P, int R, int B,
+			const float* background,
+			const int width, int height,
+			char* geom_buffer,
+			char* binning_buffer,
+			char* img_buffer,
+			char* sample_buffer,
+			const float* dL_dpix,
+			float* dL_dmean2D,
+			float* dL_dconic,
+			float* dL_dopacity,
+			float* dL_dcolor,
+			const float2* means2D,
+			const float4* conic_opacity,
+			const float* rgb,
 			bool debug,
 			const pybind11::dict &args);
 

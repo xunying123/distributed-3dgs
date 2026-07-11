@@ -207,6 +207,56 @@ def render_gaussians_l1(
         cuda_args,
     )
 
+def _render_gaussians_backward(
+    raster_settings,
+    num_rendered,
+    num_buckets,
+    geom_buffer,
+    binning_buffer,
+    image_buffer,
+    sample_buffer,
+    render_compute_locally,
+    grad_pixels,
+    means2D,
+    conic_opacity,
+    rgb,
+    cuda_args,
+):
+    backend = cuda_args["backward_backend"]
+    if backend == "per_pixel":
+        return _C.render_gaussians_backward(
+            raster_settings.bg,
+            num_rendered,
+            geom_buffer,
+            binning_buffer,
+            image_buffer,
+            render_compute_locally,
+            grad_pixels,
+            means2D,
+            conic_opacity,
+            rgb,
+            raster_settings.debug,
+            cuda_args,
+        )
+    if backend == "per_gaussian":
+        return _C.render_gaussians_backward_per_gaussian(
+            raster_settings.bg,
+            num_rendered,
+            num_buckets,
+            geom_buffer,
+            binning_buffer,
+            image_buffer,
+            sample_buffer,
+            grad_pixels,
+            means2D,
+            conic_opacity,
+            rgb,
+            raster_settings.debug,
+            cuda_args,
+        )
+    raise ValueError("Unknown backward backend: {}".format(backend))
+
+
 class _RenderGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -275,23 +325,27 @@ class _RenderGaussians(torch.autograd.Function):
         cuda_args = ctx.cuda_args
         # render_forward_start_time = ctx.render_forward_start_time
         means2D, conic_opacity, rgb, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, compute_locally, extended_compute_locally = ctx.saved_tensors
+        render_compute_locally = (
+            extended_compute_locally
+            if cuda_args["avoid_pixel_all2all"]
+            else compute_locally
+        )
 
-        # Restructure args as C++ method expects them
-        args = (raster_settings.bg,
-                num_rendered,
-                num_buckets,
-                geomBuffer,
-                binningBuffer,
-                imgBuffer,
-                sampleBuffer,
-                grad_color,# gradient of output of this operator
-                means2D,
-                conic_opacity,
-                rgb,# 3dgs intermediate results
-                raster_settings.debug,
-                cuda_args)
-
-        dL_dmeans2D, dL_dconic_opacity, dL_dcolors = _C.render_gaussians_backward(*args)
+        dL_dmeans2D, dL_dconic_opacity, dL_dcolors = _render_gaussians_backward(
+            raster_settings,
+            num_rendered,
+            num_buckets,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+            sampleBuffer,
+            render_compute_locally,
+            grad_color,
+            means2D,
+            conic_opacity,
+            rgb,
+            cuda_args,
+        )
 
         # Used when cuda_args["avoid_pixel_all2all"] is True.
         # torch.cuda.synchronize()
@@ -360,7 +414,22 @@ class _RenderGaussiansL1(torch.autograd.Function):
         ctx.cuda_args = cuda_args
         ctx.num_rendered = num_rendered
         ctx.num_buckets = num_buckets
-        ctx.save_for_backward(means2D, conic_opacity, rgb, dL_dpixels, geomBuffer, binningBuffer, imgBuffer, sampleBuffer)
+        render_compute_locally = (
+            extended_compute_locally
+            if cuda_args["avoid_pixel_all2all"]
+            else compute_locally
+        )
+        ctx.save_for_backward(
+            means2D,
+            conic_opacity,
+            rgb,
+            dL_dpixels,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+            sampleBuffer,
+            render_compute_locally,
+        )
         ctx.mark_non_differentiable(n_render, n_consider, n_contrib)
 
         return color, loss, n_render, n_consider, n_contrib
@@ -371,7 +440,7 @@ class _RenderGaussiansL1(torch.autograd.Function):
         num_buckets = ctx.num_buckets
         raster_settings = ctx.raster_settings
         cuda_args = ctx.cuda_args
-        means2D, conic_opacity, rgb, dL_dpixels, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = ctx.saved_tensors
+        means2D, conic_opacity, rgb, dL_dpixels, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, render_compute_locally = ctx.saved_tensors
 
         grad_pixels = None
         if grad_loss is not None:
@@ -381,21 +450,21 @@ class _RenderGaussiansL1(torch.autograd.Function):
         if grad_pixels is None:
             grad_pixels = torch.zeros_like(dL_dpixels)
 
-        args = (raster_settings.bg,
-                num_rendered,
-                num_buckets,
-                geomBuffer,
-                binningBuffer,
-                imgBuffer,
-                sampleBuffer,
-                grad_pixels.contiguous(),
-                means2D,
-                conic_opacity,
-                rgb,
-                raster_settings.debug,
-                cuda_args)
-
-        dL_dmeans2D, dL_dconic_opacity, dL_dcolors = _C.render_gaussians_backward(*args)
+        dL_dmeans2D, dL_dconic_opacity, dL_dcolors = _render_gaussians_backward(
+            raster_settings,
+            num_rendered,
+            num_buckets,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+            sampleBuffer,
+            render_compute_locally,
+            grad_pixels.contiguous(),
+            means2D,
+            conic_opacity,
+            rgb,
+            cuda_args,
+        )
         dL_dmeans2D = dL_dmeans2D[:,:2]
 
         return (

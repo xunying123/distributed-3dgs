@@ -168,7 +168,22 @@ RenderGaussiansL1CUDA(
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansBackwardCUDA(
- 	const torch::Tensor& background,
+	const torch::Tensor& background,
+	const int R,
+	const torch::Tensor& geomBuffer,
+	const torch::Tensor& binningBuffer,
+	const torch::Tensor& imageBuffer,
+	const torch::Tensor& compute_locally,
+    const torch::Tensor& dL_dout_color,
+	const torch::Tensor& means2D,
+	const torch::Tensor& conic_opacity,
+	const torch::Tensor& rgb,
+	const bool debug,
+	const pybind11::dict &args);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+RenderGaussiansBackwardPerGaussianCUDA(
+	const torch::Tensor& background,
 	const int R,
 	const int B,
 	const torch::Tensor& geomBuffer,
