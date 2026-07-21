@@ -359,7 +359,19 @@ class _RenderGaussians(torch.autograd.Function):
         # torch.cuda.synchronize()
         # render_forward_start_time = time.time()
 
-        num_rendered, num_buckets, color, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = _C.render_gaussians(*args)
+        (
+            num_rendered,
+            num_buckets,
+            color,
+            n_render,
+            n_consider,
+            n_contrib,
+            max_contribution_area,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+            sampleBuffer,
+        ) = _C.render_gaussians(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
@@ -368,12 +380,21 @@ class _RenderGaussians(torch.autograd.Function):
         ctx.num_buckets = num_buckets
         # ctx.render_forward_start_time = render_forward_start_time
         ctx.save_for_backward(means2D, conic_opacity, rgb, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, compute_locally, extended_compute_locally)
-        ctx.mark_non_differentiable(n_render, n_consider, n_contrib)
+        ctx.mark_non_differentiable(
+            n_render, n_consider, n_contrib, max_contribution_area
+        )
 
-        return color, n_render, n_consider, n_contrib
+        return color, n_render, n_consider, n_contrib, max_contribution_area
 
     @staticmethod
-    def backward(ctx, grad_color, grad_n_render, grad_n_consider, grad_n_contrib):
+    def backward(
+        ctx,
+        grad_color,
+        grad_n_render,
+        grad_n_consider,
+        grad_n_contrib,
+        grad_max_contribution_area,
+    ):
         # grad_n_render, grad_n_consider, grad_n_contrib should be all None. 
 
         # Restore necessary values from context
@@ -466,7 +487,21 @@ class _RenderGaussiansL1(torch.autograd.Function):
             cuda_args
         )
 
-        num_rendered, num_buckets, loss, color, dL_dpixels, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = _C.render_gaussians_l1(*args)
+        (
+            num_rendered,
+            num_buckets,
+            loss,
+            color,
+            dL_dpixels,
+            n_render,
+            n_consider,
+            n_contrib,
+            max_contribution_area,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+            sampleBuffer,
+        ) = _C.render_gaussians_l1(*args)
 
         ctx.raster_settings = raster_settings
         ctx.cuda_args = cuda_args
@@ -488,12 +523,22 @@ class _RenderGaussiansL1(torch.autograd.Function):
             sampleBuffer,
             render_compute_locally,
         )
-        ctx.mark_non_differentiable(n_render, n_consider, n_contrib)
+        ctx.mark_non_differentiable(
+            n_render, n_consider, n_contrib, max_contribution_area
+        )
 
-        return color, loss, n_render, n_consider, n_contrib
+        return color, loss, n_render, n_consider, n_contrib, max_contribution_area
 
     @staticmethod
-    def backward(ctx, grad_color, grad_loss, grad_n_render, grad_n_consider, grad_n_contrib):
+    def backward(
+        ctx,
+        grad_color,
+        grad_loss,
+        grad_n_render,
+        grad_n_consider,
+        grad_n_contrib,
+        grad_max_contribution_area,
+    ):
         num_rendered = ctx.num_rendered
         num_buckets = ctx.num_buckets
         raster_settings = ctx.raster_settings

@@ -2,6 +2,83 @@ import torch
 import utils.general_utils as utils
 
 
+def _accumulate_mini_splatting_blur_stats(gaussians, screenspace_pkg):
+    args = utils.get_args()
+    if not args.mini_splatting_pruning:
+        return
+
+    group = utils.DEFAULT_GROUP
+    rank = group.rank()
+    sizes = screenspace_pkg["gpui_to_gpuj_imgk_size"]
+    send_ids = screenspace_pkg["local_to_gpuj_camk_send_ids"]
+    rendered_areas = screenspace_pkg[
+        "batched_max_contribution_area_redistributed"
+    ]
+    cameras = screenspace_pkg["batched_viewpoint_cameras"]
+
+    if gaussians.mini_splatting_blur_mask.shape[0] != gaussians.get_xyz.shape[0]:
+        gaussians.reset_blur_split_stats()
+
+    stats_to_owner = [[] for _ in range(group.size())]
+    for camera_id, camera in enumerate(cameras):
+        rendered_count = sum(
+            int(sizes[owner][rank][camera_id]) for owner in range(group.size())
+        )
+        rendered_area = rendered_areas[camera_id]
+        if rendered_area is None:
+            rendered_area = torch.zeros(
+                rendered_count, dtype=torch.float32, device="cuda"
+            )
+        if rendered_area.numel() != rendered_count:
+            raise RuntimeError("Blur Split statistics have invalid ownership metadata")
+
+        offset = 0
+        for owner in range(group.size()):
+            count = int(sizes[owner][rank][camera_id])
+            stats_to_owner[owner].append(rendered_area[offset : offset + count])
+            offset += count
+
+    stats_to_owner = [torch.cat(stats, dim=0).contiguous() for stats in stats_to_owner]
+    recv = [
+        torch.empty(
+            sum(
+                send_ids[renderer][camera_id].numel()
+                for camera_id in range(len(cameras))
+            ),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        for renderer in range(group.size())
+    ]
+    if group.size() == 1:
+        recv[0].copy_(stats_to_owner[0])
+    else:
+        torch.distributed.all_to_all(recv, stats_to_owner, group=group)
+
+    recv_offsets = [0 for _ in range(group.size())]
+    for camera_id, camera in enumerate(cameras):
+        owner_area = torch.zeros(
+            gaussians.get_xyz.shape[0], dtype=torch.float32, device="cuda"
+        )
+        for renderer in range(group.size()):
+            ids = send_ids[renderer][camera_id].flatten()
+            if ids.numel() > 0:
+                start = recv_offsets[renderer]
+                end = start + ids.numel()
+                owner_area.index_add_(0, ids, recv[renderer][start:end])
+                recv_offsets[renderer] = end
+
+        threshold = (
+            args.mini_splatting_blur_threshold
+            * camera.image_height
+            * camera.image_width
+        )
+        gaussians.mini_splatting_blur_mask.logical_or_(owner_area > threshold)
+
+    if any(offset != tensor.numel() for offset, tensor in zip(recv_offsets, recv)):
+        raise RuntimeError("Blur Split statistics were not fully routed to owners")
+
+
 def _mini_splatting_allows_densification(iteration, args):
     return (
         not args.mini_splatting_pruning
@@ -38,6 +115,9 @@ def densification(iteration, scene, gaussians, batched_screenspace_pkg):
         timers.start("densification")
 
         timers.start("densification_update_stats")
+        _accumulate_mini_splatting_blur_stats(
+            gaussians, batched_screenspace_pkg
+        )
         for radii, visibility_filter, screenspace_mean2D in zip(
             batched_screenspace_pkg["batched_locally_preprocessed_radii"],
             batched_screenspace_pkg["batched_locally_preprocessed_visibility_filter"],
@@ -68,6 +148,11 @@ def densification(iteration, scene, gaussians, batched_screenspace_pkg):
                 args.min_opacity,
                 scene.cameras_extent,
                 size_threshold,
+                force_split_mask=(
+                    gaussians.mini_splatting_blur_mask
+                    if args.mini_splatting_pruning
+                    else None
+                ),
             )
             timers.stop("densify_and_prune")
 
@@ -87,6 +172,8 @@ def densification(iteration, scene, gaussians, batched_screenspace_pkg):
                         num_3dgs_after_redistribute,
                     )
                 )
+
+            gaussians.reset_blur_split_stats()
 
             utils.check_memory_usage(
                 log_file, args, iteration, gaussians, before_densification_stop=True

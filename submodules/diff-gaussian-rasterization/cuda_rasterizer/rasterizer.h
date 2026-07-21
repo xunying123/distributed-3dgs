@@ -169,6 +169,7 @@ namespace CudaRasterizer
 			int* n_render,
 			int* n_consider,
 			int* n_contrib,
+			float* max_contribution_area,
 			int* n_bucket,
 			bool debug,
 			const pybind11::dict &args);

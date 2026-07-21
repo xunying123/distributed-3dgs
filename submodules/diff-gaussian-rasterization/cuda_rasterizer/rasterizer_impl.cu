@@ -787,7 +787,8 @@ int CudaRasterizer::Rasterizer::renderForward(
 			imgState.max_contrib,
 			imgState.n_contrib2loss,
 			background,
-			out_color), debug)
+			out_color,
+			max_contribution_area), debug)
 	}
 	else
 	{
@@ -964,6 +965,7 @@ int CudaRasterizer::Rasterizer::renderForwardL1(
 	int* n_render,
 	int* n_consider,
 	int* n_contrib,
+	float* max_contribution_area,
 	int* n_bucket,
 	bool debug,
 	const pybind11::dict &args)
@@ -1089,7 +1091,8 @@ int CudaRasterizer::Rasterizer::renderForwardL1(
 		lambda_ssim,
 		out_loss,
 		out_color,
-		dL_dpixels), debug)
+		dL_dpixels,
+		max_contribution_area), debug)
 	timer.stop("70 render_l1");
 	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHANNELS, cudaMemcpyDeviceToDevice), debug);
 

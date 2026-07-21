@@ -62,6 +62,7 @@ class GaussianModel:
             0
         )  # TODO: deal with self.send_to_gpui_cnt
         self.denom = torch.empty(0)
+        self.mini_splatting_blur_mask = torch.empty(0, dtype=torch.bool)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -245,6 +246,7 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.reset_blur_split_stats()
 
         shard_world_size = self.group_for_redistribution().size()
         self.send_to_gpui_cnt = torch.zeros(
@@ -986,7 +988,14 @@ class GaussianModel:
             (self.send_to_gpui_cnt, new_send_to_gpui_cnt), dim=0
         )
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def reset_blur_split_stats(self):
+        self.mini_splatting_blur_mask = torch.zeros(
+            self.get_xyz.shape[0], dtype=torch.bool, device="cuda"
+        )
+
+    def densify_and_split(
+        self, grads, grad_threshold, scene_extent, force_split_mask=None, N=2
+    ):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -997,6 +1006,18 @@ class GaussianModel:
             torch.max(self.get_scaling, dim=1).values
             > self.percent_dense * scene_extent,
         )
+        if force_split_mask is not None:
+            if force_split_mask.shape[0] != grads.shape[0]:
+                raise ValueError(
+                    "Blur Split mask must match the pre-densification model"
+                )
+            padded_force_split = torch.zeros(
+                n_init_points, dtype=torch.bool, device="cuda"
+            )
+            padded_force_split[: force_split_mask.shape[0]] = force_split_mask
+            selected_pts_mask = torch.logical_or(
+                selected_pts_mask, padded_force_split
+            )
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
@@ -1069,7 +1090,14 @@ class GaussianModel:
             new_send_to_gpui_cnt,
         )
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(
+        self,
+        max_grad,
+        min_opacity,
+        extent,
+        max_screen_size,
+        force_split_mask=None,
+    ):
         args = utils.get_args()
         if not args.gaussians_distribution and utils.DEFAULT_GROUP.size() > 1:
             torch.distributed.all_reduce(
@@ -1088,9 +1116,17 @@ class GaussianModel:
         densification_stats = {}
         densification_stats["view_space_grad"] = grads.mean().item()
         densification_stats["view_space_grad_max"] = grads.max().item()
+        if force_split_mask is not None:
+            utils.get_log_file().write(
+                "Number of Blur Split gaussians: {}\n".format(
+                    force_split_mask.sum().item()
+                )
+            )
 
         self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_split(
+            grads, max_grad, extent, force_split_mask=force_split_mask
+        )
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

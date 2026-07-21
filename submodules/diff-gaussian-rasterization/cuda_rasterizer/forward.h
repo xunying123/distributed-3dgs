@@ -65,7 +65,8 @@ namespace FORWARD
 		uint32_t* max_contrib,
 		uint32_t* n_contrib2loss,
 		const float* bg_color,
-		float* out_color);
+		float* out_color,
+		float* max_contribution_area);
 
 	void render_importance(
 		const dim3 grid, dim3 block,
@@ -129,7 +130,8 @@ namespace FORWARD
 		float lambda_ssim,
 		float* out_loss,
 		float* out_color,
-		float* dL_dpixels);
+		float* dL_dpixels,
+		float* max_contribution_area);
 }
 
 

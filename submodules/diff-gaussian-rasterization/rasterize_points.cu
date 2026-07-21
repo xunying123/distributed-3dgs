@@ -274,7 +274,7 @@ torch::Tensor GetDistributionStrategyCUDA(
 
 /////////////////////////////// Render ///////////////////////////////
 
-std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansCUDA(
 	const torch::Tensor& background,
     const int image_height,
@@ -303,6 +303,10 @@ RenderGaussiansCUDA(
   torch::Tensor n_render = torch::full({tile_num}, 0, int_opts);
   torch::Tensor n_consider = torch::full({tile_num}, 0, int_opts);
   torch::Tensor n_contrib = torch::full({tile_num}, 0, int_opts);
+  const bool collect_blur_stats = args.contains("collect_blur_stats") &&
+    pybind11::cast<bool>(args["collect_blur_stats"]);
+  torch::Tensor max_contribution_area = torch::zeros(
+    {collect_blur_stats ? P : 0}, float_opts);
 
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -339,7 +343,7 @@ RenderGaussiansCUDA(
 		n_contrib.contiguous().data<int>(),//output
 		nullptr,
 		nullptr,
-		nullptr,
+		collect_blur_stats ? max_contribution_area.contiguous().data<float>() : nullptr,
 		nullptr,
 		nullptr,
 		nullptr,
@@ -351,7 +355,9 @@ RenderGaussiansCUDA(
 		debug,
 		args);
   }
-  return std::make_tuple(rendered, n_bucket, out_color, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer, sampleBuffer);
+  return std::make_tuple(
+    rendered, n_bucket, out_color, n_render, n_consider, n_contrib,
+    max_contribution_area, geomBuffer, binningBuffer, imgBuffer, sampleBuffer);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
@@ -514,7 +520,7 @@ RenderGaussiansDepthCUDA(
 	return std::make_tuple(out_points, remaining_transmittance);
 }
 
-std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansL1CUDA(
 	const torch::Tensor& background,
 	const int image_height,
@@ -551,6 +557,10 @@ RenderGaussiansL1CUDA(
   torch::Tensor n_render = torch::full({tile_num}, 0, int_opts);
   torch::Tensor n_consider = torch::full({tile_num}, 0, int_opts);
   torch::Tensor n_contrib = torch::full({tile_num}, 0, int_opts);
+  const bool collect_blur_stats = args.contains("collect_blur_stats") &&
+    pybind11::cast<bool>(args["collect_blur_stats"]);
+  torch::Tensor max_contribution_area = torch::zeros(
+    {collect_blur_stats ? P : 0}, float_opts);
 
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -593,11 +603,15 @@ RenderGaussiansL1CUDA(
 		n_render.contiguous().data<int>(),
 		n_consider.contiguous().data<int>(),
 		n_contrib.contiguous().data<int>(),
+		collect_blur_stats ? max_contribution_area.contiguous().data<float>() : nullptr,
 		&n_bucket,
 		debug,
 		args);
   }
-  return std::make_tuple(rendered, n_bucket, out_loss, out_color, dL_dpixels, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer, sampleBuffer);
+  return std::make_tuple(
+    rendered, n_bucket, out_loss, out_color, dL_dpixels, n_render, n_consider,
+    n_contrib, max_contribution_area, geomBuffer, binningBuffer, imgBuffer,
+    sampleBuffer);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>

@@ -133,7 +133,7 @@ torch::Tensor GetPixelsComputeLocallyAndInRect(
 /////////////////////////////// Render ///////////////////////////////
 
 
-std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansCUDA(
 	const torch::Tensor& background,
     const int image_height,
@@ -180,7 +180,7 @@ RenderGaussiansDepthCUDA(
 	const bool debug,
 	const pybind11::dict &args);
 
-std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansL1CUDA(
 		const torch::Tensor& background,
 	    const int image_height,

@@ -542,7 +542,7 @@ def render(screenspace_pkg, strategy=None):
         screenspace_pkg["cuda_args"]["stats_collector"]["backward_loss_time"] = 0.0
         return rendered_image, compute_locally
     else:
-        rendered_image, n_render, n_consider, n_contrib = screenspace_pkg[
+        rendered_image, n_render, n_consider, n_contrib, _ = screenspace_pkg[
             "rasterizer"
         ].render_gaussians(
             means2D=screenspace_pkg["means2D_for_render"],
@@ -565,6 +565,13 @@ def render(screenspace_pkg, strategy=None):
 def get_cuda_args_final(strategy, mode="train"):
     args = utils.get_args()
     iteration = utils.get_cur_iter()
+    collect_blur_stats = (
+        mode == "train"
+        and args.mini_splatting_pruning
+        and not args.disable_auto_densification
+        and iteration <= args.densify_until_iter
+        and iteration < args.mini_splatting_simp_iteration1
+    )
 
     if mode == "train":
         for x in range(args.bsz):
@@ -590,6 +597,7 @@ def get_cuda_args_final(strategy, mode="train"):
         "zhx_time": str(args.zhx_time),
         "avoid_pixel_all2all": False,
         "backward_backend": args.backward_backend,
+        "collect_blur_stats": collect_blur_stats,
         "stats_collector": {},
     }
     return cuda_args
@@ -1340,12 +1348,14 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
 
     batched_rendered_image = []
     batched_compute_locally = []
+    batched_max_contribution_area = []
 
     for cam_id in range(len(batched_screenspace_pkg["batched_rasterizers"])):
         strategy = batched_strategies[cam_id]
         if utils.GLOBAL_RANK not in strategy.gpu_ids:
             batched_rendered_image.append(None)
             batched_compute_locally.append(None)
+            batched_max_contribution_area.append(None)
             continue
 
         # get compute_locally to know local workload in the end2end distributed training.
@@ -1386,6 +1396,12 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
             cuda_args["stats_collector"]["backward_render_time"] = 0.0
             cuda_args["stats_collector"]["forward_loss_time"] = 0.0
             cuda_args["stats_collector"].pop("fused_loss", None)
+            max_contribution_area = torch.zeros(
+                means2D_redistributed.shape[0]
+                if cuda_args["collect_blur_stats"]
+                else 0,
+                device="cuda",
+            )
         elif (
             use_fused_local_loss
             and cuda_args["mode"] == "train"
@@ -1402,43 +1418,56 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
             loss_scale = 1.0 / float(utils.get_num_pixels() * 3)
             lambda_l1 = (1.0 - args.lambda_dssim) * loss_scale
             lambda_ssim = args.lambda_dssim * loss_scale
-            rendered_image, fused_loss, n_render, n_consider, n_contrib = (
-                rasterizer.render_gaussians_l1(
-                    means2D=means2D_redistributed,
-                    conic_opacity=conic_opacity_redistributed,
-                    rgb=rgb_redistributed,
-                    depths=depths_redistributed,
-                    radii=radii_redistributed,
-                    compute_locally=compute_locally,
-                    extended_compute_locally=extended_compute_locally,
-                    gt_image=gt_image,
-                    gt_image_y_offset=gt_image_y_offset,
-                    lambda_l1=lambda_l1,
-                    lambda_ssim=lambda_ssim,
-                    cuda_args=cuda_args,
-                )
+            (
+                rendered_image,
+                fused_loss,
+                n_render,
+                n_consider,
+                n_contrib,
+                max_contribution_area,
+            ) = rasterizer.render_gaussians_l1(
+                means2D=means2D_redistributed,
+                conic_opacity=conic_opacity_redistributed,
+                rgb=rgb_redistributed,
+                depths=depths_redistributed,
+                radii=radii_redistributed,
+                compute_locally=compute_locally,
+                extended_compute_locally=extended_compute_locally,
+                gt_image=gt_image,
+                gt_image_y_offset=gt_image_y_offset,
+                lambda_l1=lambda_l1,
+                lambda_ssim=lambda_ssim,
+                cuda_args=cuda_args,
             )
             cuda_args["stats_collector"]["fused_loss"] = fused_loss
         else:
             cuda_args["stats_collector"].pop("fused_loss", None)
-            rendered_image, n_render, n_consider, n_contrib = (
-                rasterizer.render_gaussians(
-                    means2D=means2D_redistributed,
-                    conic_opacity=conic_opacity_redistributed,
-                    rgb=rgb_redistributed,
-                    depths=depths_redistributed,
-                    radii=radii_redistributed,
-                    compute_locally=compute_locally,
-                    extended_compute_locally=extended_compute_locally,
-                    cuda_args=cuda_args,
-                )
+            (
+                rendered_image,
+                n_render,
+                n_consider,
+                n_contrib,
+                max_contribution_area,
+            ) = rasterizer.render_gaussians(
+                means2D=means2D_redistributed,
+                conic_opacity=conic_opacity_redistributed,
+                rgb=rgb_redistributed,
+                depths=depths_redistributed,
+                radii=radii_redistributed,
+                compute_locally=compute_locally,
+                extended_compute_locally=extended_compute_locally,
+                cuda_args=cuda_args,
             )
         batched_rendered_image.append(rendered_image)
         batched_compute_locally.append(compute_locally)
+        batched_max_contribution_area.append(max_contribution_area)
 
         if timers is not None:
             timers.stop("forward_render_gaussians")
     utils.check_initial_gpu_memory_usage("after forward_render_gaussians")
+    batched_screenspace_pkg[
+        "batched_max_contribution_area_redistributed"
+    ] = batched_max_contribution_area
 
     ########## [END] CUDA Rasterization Call ##########
     return batched_rendered_image, batched_compute_locally

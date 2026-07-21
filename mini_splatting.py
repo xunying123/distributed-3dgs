@@ -496,6 +496,7 @@ def run_mini_splatting_pruning(
         train_dataset.cur_epoch_cameras = []
     gaussians.training_setup(opt_args)
     gaussians.redistribute_gaussians()
+    gaussians.reset_blur_split_stats()
     _reset_strategy_history(strategy_history)
 
     after = _global_count(gaussians.get_xyz.shape[0])

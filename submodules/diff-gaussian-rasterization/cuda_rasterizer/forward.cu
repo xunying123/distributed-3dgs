@@ -390,11 +390,14 @@ renderCUDA(
 			thread_n_contrib2loss++;
 
 			const float weight = alpha * T;
-			if (COLLECT_IMPORTANCE)
+			if (COLLECT_IMPORTANCE &&
+				(accum_weights != nullptr || projected_area != nullptr || max_contribution_area != nullptr))
 			{
 				const int gaussian_id = collected_id[j];
-				atomicAdd(&accum_weights[gaussian_id], weight);
-				atomicAdd(&projected_area[gaussian_id], 1);
+				if (accum_weights != nullptr)
+					atomicAdd(&accum_weights[gaussian_id], weight);
+				if (projected_area != nullptr)
+					atomicAdd(&projected_area[gaussian_id], 1);
 				if (weight > max_weight)
 				{
 					max_weight = weight;
@@ -414,7 +417,7 @@ renderCUDA(
 		}
 	}
 
-	if (COLLECT_IMPORTANCE && max_weight_id >= 0)
+	if (COLLECT_IMPORTANCE && max_contribution_area != nullptr && max_weight_id >= 0)
 		atomicAdd(&max_contribution_area[max_weight_id], 1.0f);
 
 	// All threads that treat valid pixel write out their final
@@ -453,28 +456,51 @@ void FORWARD::render(
 	uint32_t* max_contrib,
 	uint32_t* n_contrib2loss,
 	const float* bg_color,
-	float* out_color)
+	float* out_color,
+	float* max_contribution_area)
 {
-	renderCUDA<NUM_CHANNELS, false> << <grid, block >> > (
-		ranges,
-		point_list,
-		per_tile_bucket_offset,
-		bucket_to_tile,
-		sampled_T,
-		sampled_ar,
-		W, H,
-		means2D,
-		colors,
-		conic_opacity,
-		final_T,
-		n_contrib,
-		max_contrib,
-		n_contrib2loss,
-		bg_color,
-		out_color,
-		nullptr,
-		nullptr,
-		nullptr);
+	if (max_contribution_area != nullptr)
+		renderCUDA<NUM_CHANNELS, true> << <grid, block >> > (
+			ranges,
+			point_list,
+			per_tile_bucket_offset,
+			bucket_to_tile,
+			sampled_T,
+			sampled_ar,
+			W, H,
+			means2D,
+			colors,
+			conic_opacity,
+			final_T,
+			n_contrib,
+			max_contrib,
+			n_contrib2loss,
+			bg_color,
+			out_color,
+			nullptr,
+			nullptr,
+			max_contribution_area);
+	else
+		renderCUDA<NUM_CHANNELS, false> << <grid, block >> > (
+			ranges,
+			point_list,
+			per_tile_bucket_offset,
+			bucket_to_tile,
+			sampled_T,
+			sampled_ar,
+			W, H,
+			means2D,
+			colors,
+			conic_opacity,
+			final_T,
+			n_contrib,
+			max_contrib,
+			n_contrib2loss,
+			bg_color,
+			out_color,
+			nullptr,
+			nullptr,
+			nullptr);
 }
 
 void FORWARD::render_importance(
@@ -694,7 +720,7 @@ void FORWARD::render_depth(
 		cam_pos);
 }
 
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, bool COLLECT_BLUR_STATS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderL1CUDA(
 	const uint2* __restrict__ ranges,
@@ -720,7 +746,8 @@ renderL1CUDA(
 	float lambda_ssim,
 	float* __restrict__ out_loss,
 	float* __restrict__ out_color,
-	float* __restrict__ dL_dpixels)
+	float* __restrict__ dL_dpixels,
+	float* __restrict__ max_contribution_area)
 {
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -767,6 +794,8 @@ renderL1CUDA(
 	uint32_t last_contributor = 0;
 	uint32_t thread_n_contrib2loss = 0;
 	float C[CHANNELS] = { 0 };
+	float max_weight = 0.0f;
+	int max_weight_id = -1;
 
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -814,13 +843,21 @@ renderL1CUDA(
 			}
 
 			thread_n_contrib2loss++;
+			const float weight = alpha * T;
+			if (COLLECT_BLUR_STATS && weight > max_weight)
+			{
+				max_weight = weight;
+				max_weight_id = collected_id[j];
+			}
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * weight;
 
 			T = test_T;
 			last_contributor = contributor;
 		}
 	}
+	if (COLLECT_BLUR_STATS && max_weight_id >= 0)
+		atomicAdd(&max_contribution_area[max_weight_id], 1.0f);
 
 	float local_l1_loss = 0.0f;
 	float rendered_values[CHANNELS] = { 0.0f };
@@ -971,33 +1008,63 @@ void FORWARD::render_l1(
 	float lambda_ssim,
 	float* out_loss,
 	float* out_color,
-	float* dL_dpixels)
+	float* dL_dpixels,
+	float* max_contribution_area)
 {
-	renderL1CUDA<NUM_CHANNELS> << <grid, block >> > (
-		ranges,
-		point_list,
-		per_tile_bucket_offset,
-		bucket_to_tile,
-		sampled_T,
-		sampled_ar,
-		W, H,
-		means2D,
-		colors,
-		conic_opacity,
-		final_T,
-		n_contrib,
-		max_contrib,
-		n_contrib2loss,
-		bg_color,
-		gt_image,
-		gt_image_y_offset,
-		gt_image_height,
-		loss_compute_locally,
-		lambda_l1,
-		lambda_ssim,
-		out_loss,
-		out_color,
-		dL_dpixels);
+	if (max_contribution_area != nullptr)
+		renderL1CUDA<NUM_CHANNELS, true> << <grid, block >> > (
+			ranges,
+			point_list,
+			per_tile_bucket_offset,
+			bucket_to_tile,
+			sampled_T,
+			sampled_ar,
+			W, H,
+			means2D,
+			colors,
+			conic_opacity,
+			final_T,
+			n_contrib,
+			max_contrib,
+			n_contrib2loss,
+			bg_color,
+			gt_image,
+			gt_image_y_offset,
+			gt_image_height,
+			loss_compute_locally,
+			lambda_l1,
+			lambda_ssim,
+			out_loss,
+			out_color,
+			dL_dpixels,
+			max_contribution_area);
+	else
+		renderL1CUDA<NUM_CHANNELS, false> << <grid, block >> > (
+			ranges,
+			point_list,
+			per_tile_bucket_offset,
+			bucket_to_tile,
+			sampled_T,
+			sampled_ar,
+			W, H,
+			means2D,
+			colors,
+			conic_opacity,
+			final_T,
+			n_contrib,
+			max_contrib,
+			n_contrib2loss,
+			bg_color,
+			gt_image,
+			gt_image_y_offset,
+			gt_image_height,
+			loss_compute_locally,
+			lambda_l1,
+			lambda_ssim,
+			out_loss,
+			out_color,
+			dL_dpixels,
+			nullptr);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

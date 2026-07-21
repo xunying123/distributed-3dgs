@@ -139,6 +139,7 @@ class OptimizationParams(ParamGroup):
         self.mini_splatting_second_keep_mass = 0.99
         self.mini_splatting_imp_metric = "outdoor"
         self.mini_splatting_seed = 0
+        self.mini_splatting_blur_threshold = 2e-4
         self.mini_splatting_depth_reinitialization_interval = 5000
         self.mini_splatting_num_depth = 3_500_000
         self.lr_scale_mode = "sqrt"  # can be "linear", "sqrt", or "accumu"
@@ -321,6 +322,8 @@ def init_args(args):
             raise ValueError(
                 "--mini_splatting_imp_metric must be 'outdoor' or 'indoor'"
             )
+        if args.mini_splatting_blur_threshold <= 0.0:
+            raise ValueError("--mini_splatting_blur_threshold must be positive")
         if args.mini_splatting_depth_reinitialization_interval <= 0:
             raise ValueError(
                 "--mini_splatting_depth_reinitialization_interval must be positive"
