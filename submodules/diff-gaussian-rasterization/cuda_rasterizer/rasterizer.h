@@ -132,6 +132,13 @@ namespace CudaRasterizer
 			float* accum_weights,
 			int* projected_area,
 			float* max_contribution_area,
+			float* out_points,
+			float* remaining_transmittance,
+			const float* means3D,
+			const float* scales,
+			const float* rotations,
+			const float* projmatrix,
+			const float* cam_pos,
 			int* n_bucket,
 			bool debug,
 			const pybind11::dict &args);

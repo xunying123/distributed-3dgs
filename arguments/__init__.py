@@ -139,6 +139,8 @@ class OptimizationParams(ParamGroup):
         self.mini_splatting_second_keep_mass = 0.99
         self.mini_splatting_imp_metric = "outdoor"
         self.mini_splatting_seed = 0
+        self.mini_splatting_depth_reinitialization_interval = 5000
+        self.mini_splatting_num_depth = 3_500_000
         self.lr_scale_mode = "sqrt"  # can be "linear", "sqrt", or "accumu"
         super().__init__(parser, "Optimization Parameters")
 
@@ -300,6 +302,10 @@ def init_args(args):
                 "--mini_splatting_pruning requires distributed Gaussian storage "
                 "when using multiple GPUs"
             )
+        if args.local_sampling:
+            raise ValueError(
+                "--mini_splatting_pruning does not support --local_sampling"
+            )
         if args.mini_splatting_simp_iteration1 < 0:
             raise ValueError("--mini_splatting_simp_iteration1 must be non-negative")
         if args.mini_splatting_simp_iteration2 <= args.mini_splatting_simp_iteration1:
@@ -315,6 +321,12 @@ def init_args(args):
             raise ValueError(
                 "--mini_splatting_imp_metric must be 'outdoor' or 'indoor'"
             )
+        if args.mini_splatting_depth_reinitialization_interval <= 0:
+            raise ValueError(
+                "--mini_splatting_depth_reinitialization_interval must be positive"
+            )
+        if args.mini_splatting_num_depth <= 0:
+            raise ValueError("--mini_splatting_num_depth must be positive")
 
     if args.opacity_reset_until_iter == -1:
         args.opacity_reset_until_iter = args.densify_until_iter + args.bsz

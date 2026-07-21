@@ -5,8 +5,10 @@ import torch.distributed as dist
 
 from gaussian_renderer import (
     distributed_preprocess3dgs_and_all2all_final,
+    render_mini_splatting_depth,
     render_mini_splatting_importance,
 )
+from gaussian_renderer.loss_distribution import load_camera_from_cpu_to_all_gpu
 from gaussian_renderer.workload_division import start_strategy_final
 from simple_knn._C import distCUDA2
 import utils.general_utils as utils
@@ -100,7 +102,9 @@ def _route_stats_to_owners(
         (importance.shape[0], 3), dtype=torch.float32, device="cuda"
     )
     for renderer in range(group.size()):
-        ids = local_send_ids[renderer][0].to(device="cuda", dtype=torch.long)
+        ids = local_send_ids[renderer][0].to(
+            device="cuda", dtype=torch.long
+        ).flatten()
         if ids.numel() > 0:
             owner_stats.index_add_(0, ids, recv[renderer])
 
@@ -222,11 +226,231 @@ def _global_knn_dist2(local_xyz):
     return _scatter_from_rank0(global_dist2, counts, local_template)
 
 
+def _redistribute_depth_parameters(gaussians, screenspace_pkg):
+    group = utils.DEFAULT_GROUP
+    rank = group.rank()
+    send_ids = screenspace_pkg["local_to_gpuj_camk_send_ids"]
+    sizes = screenspace_pkg["gpui_to_gpuj_imgk_size"]
+    local_parameters = torch.cat(
+        (gaussians.get_xyz, gaussians.get_scaling, gaussians.get_rotation), dim=1
+    )
+    send = [
+        local_parameters[send_ids[renderer][0].flatten()].contiguous()
+        for renderer in range(group.size())
+    ]
+    recv = [
+        torch.empty(
+            (int(sizes[owner][rank][0]), 10),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        for owner in range(group.size())
+    ]
+    if group.size() == 1:
+        recv[0].copy_(send[0])
+    else:
+        dist.all_to_all(recv, send, group=group)
+    redistributed = torch.cat(recv, dim=0)
+    return tuple(
+        parameter.contiguous()
+        for parameter in torch.split(redistributed, [3, 3, 4], dim=1)
+    )
+
+
+def _sample_depth_candidates(
+    out_points,
+    remaining_transmittance,
+    camera,
+    strategy,
+    target,
+    seed,
+):
+    group = utils.DEFAULT_GROUP
+    if utils.GLOBAL_RANK in strategy.gpu_ids:
+        render_rank = strategy.gpu_ids.index(utils.GLOBAL_RANK)
+        min_y = strategy.division_pos[render_rank] * utils.BLOCK_Y
+        max_y = min(
+            strategy.division_pos[render_rank + 1] * utils.BLOCK_Y,
+            camera.image_height,
+        )
+        weights = (1.0 - remaining_transmittance[min_y:max_y]).flatten()
+        points = (
+            out_points[:, min_y:max_y]
+            .permute(1, 2, 0)
+            .reshape(-1, 3)
+        )
+        colors = camera.original_image
+        if colors.dtype == torch.uint8:
+            colors = colors.float() / 255.0
+        else:
+            colors = colors.float().clamp(0.0, 1.0)
+        colors = colors.permute(1, 2, 0).reshape(-1, 3)
+
+        positive = weights > 0
+        positive_ids = torch.nonzero(positive, as_tuple=False).flatten()
+        local_target = min(target, positive_ids.numel())
+        if local_target > 0:
+            # Exponential-race keys give exact weighted sampling without replacement;
+            # a global top-k only needs each rank's local top-k candidates.
+            generator = torch.Generator(device="cuda")
+            generator.manual_seed(seed + group.rank())
+            uniform = torch.rand(
+                positive_ids.numel(), device="cuda", generator=generator
+            ).clamp_min_(1e-12)
+            keys = -torch.log(uniform) / weights[positive_ids]
+            selected = torch.topk(
+                keys, local_target, largest=False, sorted=False
+            ).indices
+            pixel_ids = positive_ids[selected]
+            candidates = torch.cat(
+                (
+                    keys[selected, None],
+                    points[pixel_ids],
+                    colors[pixel_ids],
+                ),
+                dim=1,
+            )
+        else:
+            candidates = torch.empty((0, 7), dtype=torch.float32, device="cuda")
+    else:
+        candidates = torch.empty((0, 7), dtype=torch.float32, device="cuda")
+
+    candidate_counts = _counts(candidates.shape[0])
+    global_candidates = _gather_to_rank0(candidates, candidate_counts)
+    available = 0
+    selected_candidates = None
+    if group.rank() == 0:
+        available = global_candidates.shape[0]
+        if available >= target:
+            selected = torch.topk(
+                global_candidates[:, 0], target, largest=False, sorted=False
+            ).indices
+            selected_candidates = global_candidates[selected]
+
+    status = torch.tensor([available, target], dtype=torch.long, device="cuda")
+    if group.size() > 1:
+        dist.broadcast(status, src=0, group=group)
+    if status[0].item() < status[1].item():
+        raise RuntimeError(
+            "Mini-Splatting depth reinitialization has fewer positive-probability "
+            "pixels than requested samples"
+        )
+    return selected_candidates
+
+
+def run_mini_splatting_depth_reinitialization(
+    iteration,
+    train_dataset,
+    gaussians,
+    pipe_args,
+    opt_args,
+    background,
+    strategy_history,
+):
+    args = utils.get_args()
+    group = utils.DEFAULT_GROUP
+    views = train_dataset.cameras
+    samples_per_view = int(args.mini_splatting_num_depth / len(views))
+    if samples_per_view <= 0:
+        raise RuntimeError("--mini_splatting_num_depth is too small for this dataset")
+
+    sampled_points = []
+    sampled_colors = []
+    before = _global_count(gaussians.get_xyz.shape[0])
+    for camera_index, camera in enumerate(views):
+        strategies, gpuid2tasks = start_strategy_final([camera], strategy_history)
+        load_camera_from_cpu_to_all_gpu([camera], strategies, gpuid2tasks)
+        screenspace_pkg = distributed_preprocess3dgs_and_all2all_final(
+            [camera],
+            gaussians,
+            pipe_args,
+            background,
+            batched_strategies=strategies,
+            iteration=iteration,
+            mode="test",
+        )
+        means3D, scales, rotations = _redistribute_depth_parameters(
+            gaussians, screenspace_pkg
+        )
+        out_points, remaining_transmittance = render_mini_splatting_depth(
+            screenspace_pkg,
+            strategies,
+            [means3D],
+            [scales],
+            [rotations],
+        )[0]
+        selected = _sample_depth_candidates(
+            out_points,
+            remaining_transmittance,
+            camera,
+            strategies[0],
+            samples_per_view,
+            args.mini_splatting_seed
+            + iteration * len(views)
+            + camera_index * group.size(),
+        )
+        if group.rank() == 0:
+            sampled_points.append(selected[:, 1:4])
+            sampled_colors.append(selected[:, 4:7])
+        camera.original_image = None
+        camera.unload_image()
+        del (
+            screenspace_pkg,
+            out_points,
+            remaining_transmittance,
+            means3D,
+            scales,
+            rotations,
+        )
+
+    global_points = None
+    global_colors = None
+    total_points = samples_per_view * len(views)
+    if group.rank() == 0:
+        global_points = torch.cat(sampled_points, dim=0).contiguous()
+        global_colors = torch.cat(sampled_colors, dim=0).contiguous()
+        global_dist2 = torch.clamp_min(distCUDA2(global_points), 1e-7)
+    else:
+        global_dist2 = None
+
+    base = total_points // group.size()
+    remainder = total_points % group.size()
+    shard_counts = [base + int(rank < remainder) for rank in range(group.size())]
+    local_count = shard_counts[group.rank()]
+    xyz_template = torch.empty((local_count, 3), device="cuda")
+    dist_template = torch.empty(local_count, device="cuda")
+    local_xyz = _scatter_from_rank0(global_points, shard_counts, xyz_template)
+    local_rgb = _scatter_from_rank0(global_colors, shard_counts, xyz_template)
+    local_dist2 = _scatter_from_rank0(global_dist2, shard_counts, dist_template)
+
+    gaussians.reinitialize_from_mini_splatting_depth(
+        local_xyz, local_rgb, local_dist2
+    )
+    gaussians.training_setup(opt_args)
+    train_dataset.cur_epoch_cameras = []
+    _reset_strategy_history(strategy_history)
+    message = (
+        "Mini-Splatting depth reinitialization at iteration {}: views={} "
+        "before={} after={}\n".format(
+            iteration, len(views), before, total_points
+        )
+    )
+    utils.get_log_file().write(message)
+    utils.print_rank_0(message.rstrip())
+    torch.cuda.empty_cache()
+    return before, total_points
+
+
 def _global_count(local_count):
     count = torch.tensor([local_count], dtype=torch.long, device="cuda")
     if utils.DEFAULT_GROUP.size() > 1:
         dist.all_reduce(count, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
     return int(count.item())
+
+
+def _reset_strategy_history(strategy_history):
+    for heuristic in strategy_history.accum_heuristic.values():
+        heuristic.fill_(1.0)
 
 
 def run_mini_splatting_pruning(
@@ -272,6 +496,7 @@ def run_mini_splatting_pruning(
         train_dataset.cur_epoch_cameras = []
     gaussians.training_setup(opt_args)
     gaussians.redistribute_gaussians()
+    _reset_strategy_history(strategy_history)
 
     after = _global_count(gaussians.get_xyz.shape[0])
     message = (

@@ -161,6 +161,25 @@ RenderGaussiansImportanceCUDA(
 	const bool debug,
 	const pybind11::dict &args);
 
+std::tuple<torch::Tensor, torch::Tensor>
+RenderGaussiansDepthCUDA(
+	const torch::Tensor& background,
+	const int image_height,
+	const int image_width,
+	torch::Tensor& means2D,
+	torch::Tensor& depths,
+	torch::Tensor& radii,
+	torch::Tensor& conic_opacity,
+	torch::Tensor& rgb,
+	const torch::Tensor& compute_locally,
+	const torch::Tensor& means3D,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const torch::Tensor& projmatrix,
+	const torch::Tensor& campos,
+	const bool debug,
+	const pybind11::dict &args);
+
 std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansL1CUDA(
 		const torch::Tensor& background,

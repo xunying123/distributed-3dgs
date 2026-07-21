@@ -27,7 +27,10 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 import torch.distributed as dist
 from densification import densification, gsplat_densification
-from mini_splatting import run_mini_splatting_pruning
+from mini_splatting import (
+    run_mini_splatting_depth_reinitialization,
+    run_mini_splatting_pruning,
+)
 
 
 START_NSIGHT_PROFILE_AFTER_ITERATION = 99900
@@ -130,7 +133,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if nsight_profile_started:
             nvtx.range_push(f"iteration[{iteration},{iteration+args.bsz})")
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        if utils.check_update_at_this_iter(iteration, args.bsz, 1000, 0):
+        if (
+            not args.mini_splatting_pruning
+            or iteration > args.mini_splatting_simp_iteration1
+        ) and utils.check_update_at_this_iter(iteration, args.bsz, 1000, 0):
             gaussians.oneupSHdegree()
 
         # Prepare data: Pick random Cameras for training
@@ -289,6 +295,33 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 densification(iteration, scene, gaussians, batched_screenspace_pkg)
 
             if args.mini_splatting_pruning:
+                depth_limit = min(
+                    args.densify_until_iter,
+                    args.mini_splatting_simp_iteration1,
+                )
+                depth_targets = range(
+                    args.mini_splatting_depth_reinitialization_interval,
+                    depth_limit,
+                    args.mini_splatting_depth_reinitialization_interval,
+                )
+                for target_iteration in depth_targets:
+                    stage = "depth_{}".format(target_iteration)
+                    if (
+                        stage not in completed_mini_splatting_stages
+                        and iteration <= target_iteration < iteration + args.bsz
+                    ):
+                        run_mini_splatting_depth_reinitialization(
+                            target_iteration,
+                            train_dataset,
+                            gaussians,
+                            pipe_args,
+                            opt_args,
+                            background,
+                            strategy_history,
+                        )
+                        completed_mini_splatting_stages.add(stage)
+                        mini_splatting_pruned_this_iteration = True
+
                 mini_splatting_stages = [
                     ("sample", args.mini_splatting_simp_iteration1),
                     ("prune", args.mini_splatting_simp_iteration2),

@@ -633,6 +633,13 @@ int CudaRasterizer::Rasterizer::renderForward(
 	float* accum_weights,
 	int* projected_area,
 	float* max_contribution_area,
+	float* out_points,
+	float* remaining_transmittance,
+	const float* means3D,
+	const float* scales,
+	const float* rotations,
+	const float* projmatrix,
+	const float* cam_pos,
 	int* n_bucket,
 	bool debug,
 	const pybind11::dict &args)
@@ -744,7 +751,24 @@ int CudaRasterizer::Rasterizer::renderForward(
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = rgb;
 	timer.start("70 render");
-	if (accum_weights == nullptr)
+	if (out_points != nullptr)
+	{
+		CHECK_CUDA(FORWARD::render_depth(
+			tile_grid, block,
+			imgState.ranges,
+			binningState.point_list,
+			width, height,
+			means2D,
+			conic_opacity,
+			out_points,
+			remaining_transmittance,
+			means3D,
+			(glm::vec3*)scales,
+			(glm::vec4*)rotations,
+			projmatrix,
+			(glm::vec3*)cam_pos), debug)
+	}
+	else if (accum_weights == nullptr)
 	{
 		CHECK_CUDA(FORWARD::render(//TODO: only deal with local tiles. do not even load other tiles.
 			tile_grid, block,
@@ -790,34 +814,35 @@ int CudaRasterizer::Rasterizer::renderForward(
 			max_contribution_area), debug)
 	}
 	timer.stop("70 render");
-	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHANNELS, cudaMemcpyDeviceToDevice), debug);
+	if (out_points == nullptr)
+	{
+		CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHANNELS, cudaMemcpyDeviceToDevice), debug);
 
-	// TODO: write a kernel to sum a block for n_contrib2loss and save the result in contrib. 
-	// We may have different implementation.
-
-	timer.start("81 sum_n_render");
-	get_n_render<<< (num_tiles + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
-		num_tiles,
-		imgState.ranges,
-		n_render
-	);
-	timer.stop("81 sum_n_render");
-	timer.start("82 sum_n_consider");
-	reduce_data_per_block<< <tile_grid, block >> > (
-		width, height,
-		imgState.n_contrib,
-		n_consider,
-		compute_locally
-	);
-	timer.stop("82 sum_n_consider");
-	timer.start("83 sum_n_contrib");
-	reduce_data_per_block<< <tile_grid, block >> > (
-		width, height,
-		imgState.n_contrib2loss,
-		n_contrib,
-		compute_locally
-	);
-	timer.stop("83 sum_n_contrib");
+		// TODO: write a kernel to sum a block for n_contrib2loss and save the result in contrib.
+		timer.start("81 sum_n_render");
+		get_n_render<<< (num_tiles + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
+			num_tiles,
+			imgState.ranges,
+			n_render
+		);
+		timer.stop("81 sum_n_render");
+		timer.start("82 sum_n_consider");
+		reduce_data_per_block<< <tile_grid, block >> > (
+			width, height,
+			imgState.n_contrib,
+			n_consider,
+			compute_locally
+		);
+		timer.stop("82 sum_n_consider");
+		timer.start("83 sum_n_contrib");
+		reduce_data_per_block<< <tile_grid, block >> > (
+			width, height,
+			imgState.n_contrib2loss,
+			n_contrib,
+			compute_locally
+		);
+		timer.stop("83 sum_n_contrib");
+	}
 
 	float forward_render_time = timer.elapsedMilliseconds("70 render", "sum") + timer.elapsedMilliseconds("50 SortPairs", "sum") + timer.elapsedMilliseconds("40 duplicateWithKeys", "sum");
 	args["stats_collector"]["forward_render_time"] = forward_render_time;

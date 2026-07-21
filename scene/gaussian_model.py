@@ -870,6 +870,37 @@ class GaussianModel:
         self.active_sh_degree = 0
         self.max_radii2D = torch.zeros(point_count, device="cuda")
 
+    def reinitialize_from_mini_splatting_depth(self, xyz, rgb, global_dist2):
+        """Replace the model with points sampled by depth reinitialization."""
+        point_count = xyz.shape[0]
+        features = torch.zeros(
+            (point_count, 3, (self.max_sh_degree + 1) ** 2),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        features[:, :, 0] = RGB2SH(rgb)
+        scales = torch.log(torch.sqrt(torch.clamp_min(global_dist2, 1e-7)))[
+            ..., None
+        ].repeat(1, 3)
+        rotations = torch.zeros((point_count, 4), device="cuda")
+        rotations[:, 0] = 1
+        opacities = inverse_sigmoid(
+            0.1 * torch.ones((point_count, 1), dtype=torch.float32, device="cuda")
+        )
+
+        self._xyz = nn.Parameter(xyz.contiguous().requires_grad_(True))
+        self._features_dc = nn.Parameter(
+            features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        self._features_rest = nn.Parameter(
+            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rotations.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.active_sh_degree = 0
+        self.max_radii2D = torch.zeros(point_count, device="cuda")
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:

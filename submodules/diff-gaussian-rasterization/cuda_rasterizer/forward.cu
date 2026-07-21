@@ -15,6 +15,7 @@
 #include "timers.cu"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <glm/gtc/type_ptr.hpp>
 namespace cg = cooperative_groups;
 
 // Forward method for converting the input spherical harmonics
@@ -518,6 +519,179 @@ void FORWARD::render_importance(
 		accum_weights,
 		projected_area,
 		max_contribution_area);
+}
+
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderDepthCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ out_points,
+	float* __restrict__ remaining_transmittance,
+	const float* __restrict__ means3D,
+	const glm::vec3* __restrict__ scales,
+	const glm::vec4* __restrict__ rotations,
+	const float* __restrict__ projmatrix,
+	const glm::vec3* __restrict__ cam_pos)
+{
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = {
+		block.group_index().x * BLOCK_X,
+		block.group_index().y * BLOCK_Y
+	};
+	const uint2 pix = {
+		pix_min.x + block.thread_index().x,
+		pix_min.y + block.thread_index().y
+	};
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
+	const bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
+
+	const uint32_t tile_id =
+		block.group_index().y * horizontal_blocks + block.group_index().x;
+	const uint2 range = ranges[tile_id];
+	const int rounds = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	float T = 1.0f;
+	float max_weight = 0.0f;
+	glm::vec3 point_rec = { 0.0f, 0.0f, 0.0f };
+
+	glm::mat4 matrix = glm::make_mat4x4(projmatrix);
+	glm::mat4 matrix_inv = glm::inverse(matrix);
+	float* projmatrix_inv = glm::value_ptr(matrix_inv);
+	const glm::vec3 ray_origin = *cam_pos;
+
+	const float3 p_proj = { Pix2ndc(pixf.x, W), Pix2ndc(pixf.y, H), 1.0f };
+	const float3 p_hom = {
+		p_proj.x * 1.0000001f,
+		p_proj.y * 1.0000001f,
+		(100.0f + 0.01f - 1.0f) / (100.0f - 0.01f)
+	};
+	const float4 p_orig = transformPoint4x4(p_hom, projmatrix_inv);
+	const glm::vec3 ray_direction = {
+		p_orig.x - ray_origin.x,
+		p_orig.y - ray_origin.y,
+		p_orig.z - ray_origin.z
+	};
+	const glm::vec3 normalized_ray_direction = glm::normalize(ray_direction);
+
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		if (__syncthreads_count(done) == BLOCK_SIZE)
+			break;
+
+		const int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			const int gaussian_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = gaussian_id;
+			collected_xy[block.thread_rank()] = points_xy_image[gaussian_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[gaussian_id];
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			const float2 xy = collected_xy[j];
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const float4 con_o = collected_conic_opacity[j];
+			const float power = -0.5f *
+				(con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			const float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			const float test_T = T * (1.0f - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+
+			const int gaussian_id = collected_id[j];
+			const glm::vec4 q = rotations[gaussian_id];
+			const float r = q.x;
+			const float x = q.y;
+			const float y = q.z;
+			const float z = q.w;
+			const glm::mat3 R = glm::mat3(
+				1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+				2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+				2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y));
+
+			const glm::vec3 center = {
+				means3D[3 * gaussian_id],
+				means3D[3 * gaussian_id + 1],
+				means3D[3 * gaussian_id + 2]
+			};
+			const glm::vec3 rotated_origin = R * (ray_origin - center);
+			const glm::vec3 rotated_direction = R * normalized_ray_direction;
+			const glm::vec3 sigma = scales[gaussian_id] * 3.0f;
+			const glm::vec3 direction_scaled = rotated_direction / sigma;
+			const glm::vec3 origin_scaled = rotated_origin / sigma;
+			const float a = glm::dot(direction_scaled, direction_scaled);
+			const float b = 2.0f * glm::dot(direction_scaled, origin_scaled);
+			const float depth = -b / (2.0f * a);
+			if (depth < 0.0f)
+				continue;
+
+			if (max_weight < alpha * T)
+			{
+				max_weight = alpha * T;
+				point_rec = ray_origin + depth * normalized_ray_direction;
+			}
+			T = test_T;
+		}
+	}
+
+	if (inside)
+	{
+		remaining_transmittance[pix_id] = T;
+		out_points[pix_id] = point_rec.x;
+		out_points[H * W + pix_id] = point_rec.y;
+		out_points[2 * H * W + pix_id] = point_rec.z;
+	}
+}
+
+void FORWARD::render_depth(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	const float2* means2D,
+	const float4* conic_opacity,
+	float* out_points,
+	float* remaining_transmittance,
+	const float* means3D,
+	const glm::vec3* scales,
+	const glm::vec4* rotations,
+	const float* projmatrix,
+	const glm::vec3* cam_pos)
+{
+	renderDepthCUDA << <grid, block >> > (
+		ranges,
+		point_list,
+		W, H,
+		means2D,
+		conic_opacity,
+		out_points,
+		remaining_transmittance,
+		means3D,
+		scales,
+		rotations,
+		projmatrix,
+		cam_pos);
 }
 
 template <uint32_t CHANNELS>

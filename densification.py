@@ -9,6 +9,20 @@ def _mini_splatting_allows_densification(iteration, args):
     )
 
 
+def _mini_splatting_depth_reinitializes(iteration, args):
+    return (
+        args.mini_splatting_pruning
+        and iteration < args.densify_until_iter
+        and iteration < args.mini_splatting_simp_iteration1
+        and utils.check_update_at_this_iter(
+            iteration,
+            args.bsz,
+            args.mini_splatting_depth_reinitialization_interval,
+            0,
+        )
+    )
+
+
 def densification(iteration, scene, gaussians, batched_screenspace_pkg):
     args = utils.get_args()
     timers = utils.get_timers()
@@ -35,8 +49,12 @@ def densification(iteration, scene, gaussians, batched_screenspace_pkg):
             gaussians.add_densification_stats(screenspace_mean2D, visibility_filter)
         timers.stop("densification_update_stats")
 
-        if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
-            iteration, args.bsz, args.densification_interval, 0
+        if (
+            iteration > args.densify_from_iter
+            and utils.check_update_at_this_iter(
+                iteration, args.bsz, args.densification_interval, 0
+            )
+            and not _mini_splatting_depth_reinitializes(iteration, args)
         ):
             assert (
                 args.stop_update_param == False

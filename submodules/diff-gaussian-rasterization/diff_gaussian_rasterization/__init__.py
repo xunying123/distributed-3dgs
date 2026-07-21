@@ -232,6 +232,39 @@ def render_gaussians_importance(
         cuda_args,
     )
 
+
+def render_gaussians_depth(
+    means2D,
+    conic_opacity,
+    rgb,
+    depths,
+    radii,
+    compute_locally,
+    means3D,
+    scales,
+    rotations,
+    raster_settings,
+    cuda_args,
+):
+    return _C.render_gaussians_depth(
+        raster_settings.bg,
+        raster_settings.image_height,
+        raster_settings.image_width,
+        means2D,
+        depths,
+        radii,
+        conic_opacity,
+        rgb,
+        compute_locally,
+        means3D,
+        scales,
+        rotations,
+        raster_settings.projmatrix,
+        raster_settings.campos,
+        raster_settings.debug,
+        cuda_args,
+    )
+
 def _render_gaussians_backward(
     raster_settings,
     num_rendered,
@@ -615,6 +648,33 @@ class GaussianRasterizer(nn.Module):
             depths,
             radii,
             compute_locally,
+            self.raster_settings,
+            cuda_args,
+        )
+
+    def render_gaussians_depth(
+        self,
+        means2D,
+        conic_opacity,
+        rgb,
+        depths,
+        radii,
+        compute_locally,
+        means3D,
+        scales,
+        rotations,
+        cuda_args=None,
+    ):
+        return render_gaussians_depth(
+            means2D,
+            conic_opacity,
+            rgb,
+            depths,
+            radii,
+            compute_locally,
+            means3D,
+            scales,
+            rotations,
             self.raster_settings,
             cuda_args,
         )

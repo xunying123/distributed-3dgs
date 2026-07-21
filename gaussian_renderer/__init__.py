@@ -1476,6 +1476,48 @@ def render_mini_splatting_importance(
     return batched_stats
 
 
+def render_mini_splatting_depth(
+    batched_screenspace_pkg,
+    batched_strategies,
+    batched_means3D,
+    batched_scales,
+    batched_rotations,
+):
+    """Render Mini-Splatting surface points and remaining transmittance."""
+    outputs = []
+    for cam_id, strategy in enumerate(batched_strategies):
+        means2D = batched_screenspace_pkg["batched_means2D_redistributed"][cam_id]
+        rasterizer = batched_screenspace_pkg["batched_rasterizers"][cam_id]
+        if utils.GLOBAL_RANK not in strategy.gpu_ids or means2D.shape[0] == 0:
+            height = rasterizer.raster_settings.image_height
+            width = rasterizer.raster_settings.image_width
+            outputs.append(
+                (
+                    torch.zeros((3, height, width), device="cuda"),
+                    torch.ones((height, width), device="cuda"),
+                )
+            )
+            continue
+
+        outputs.append(
+            rasterizer.render_gaussians_depth(
+                means2D=means2D,
+                conic_opacity=batched_screenspace_pkg[
+                    "batched_conic_opacity_redistributed"
+                ][cam_id],
+                rgb=batched_screenspace_pkg["batched_rgb_redistributed"][cam_id],
+                depths=batched_screenspace_pkg["batched_depths_redistributed"][cam_id],
+                radii=batched_screenspace_pkg["batched_radii_redistributed"][cam_id],
+                compute_locally=strategy.get_compute_locally(),
+                means3D=batched_means3D[cam_id],
+                scales=batched_scales[cam_id],
+                rotations=batched_rotations[cam_id],
+                cuda_args=batched_screenspace_pkg["batched_cuda_args"][cam_id],
+            )
+        )
+    return outputs
+
+
 def gsplat_render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
     """
     Render the scene.

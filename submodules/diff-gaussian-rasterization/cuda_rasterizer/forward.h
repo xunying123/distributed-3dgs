@@ -89,6 +89,21 @@ namespace FORWARD
 		int* projected_area,
 		float* max_contribution_area);
 
+	void render_depth(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float2* points_xy_image,
+		const float4* conic_opacity,
+		float* out_points,
+		float* remaining_transmittance,
+		const float* means3D,
+		const glm::vec3* scales,
+		const glm::vec4* rotations,
+		const float* projmatrix,
+		const glm::vec3* cam_pos);
+
 	void render_l1(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
