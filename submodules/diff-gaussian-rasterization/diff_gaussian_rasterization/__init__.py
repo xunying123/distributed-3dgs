@@ -207,6 +207,31 @@ def render_gaussians_l1(
         cuda_args,
     )
 
+
+def render_gaussians_importance(
+    means2D,
+    conic_opacity,
+    rgb,
+    depths,
+    radii,
+    compute_locally,
+    raster_settings,
+    cuda_args,
+):
+    return _C.render_gaussians_importance(
+        raster_settings.bg,
+        raster_settings.image_height,
+        raster_settings.image_width,
+        means2D,
+        depths,
+        radii,
+        conic_opacity,
+        rgb,
+        compute_locally,
+        raster_settings.debug,
+        cuda_args,
+    )
+
 def _render_gaussians_backward(
     raster_settings,
     num_rendered,
@@ -571,6 +596,27 @@ class GaussianRasterizer(nn.Module):
             lambda_ssim,
             raster_settings,
             cuda_args
+        )
+
+    def render_gaussians_importance(
+        self,
+        means2D,
+        conic_opacity,
+        rgb,
+        depths,
+        radii,
+        compute_locally,
+        cuda_args=None,
+    ):
+        return render_gaussians_importance(
+            means2D,
+            conic_opacity,
+            rgb,
+            depths,
+            radii,
+            compute_locally,
+            self.raster_settings,
+            cuda_args,
         )
 
 class _LoadImageTilesByPos(torch.autograd.Function):

@@ -261,7 +261,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, bool COLLECT_IMPORTANCE>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -279,7 +279,10 @@ renderCUDA(
 	uint32_t* __restrict__ max_contrib,
 	uint32_t* __restrict__ n_contrib2loss,
 	const float* __restrict__ bg_color,
-	float* __restrict__ out_color)
+	float* __restrict__ out_color,
+	float* __restrict__ accum_weights,
+	int* __restrict__ projected_area,
+	float* __restrict__ max_contribution_area)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -323,6 +326,8 @@ renderCUDA(
 	uint32_t last_contributor = 0;
 	uint32_t thread_n_contrib2loss = 0;
 	float C[CHANNELS] = { 0 };
+	float max_weight = 0.0f;
+	int max_weight_id = -1;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -383,9 +388,22 @@ renderCUDA(
 
 			thread_n_contrib2loss++;
 
+			const float weight = alpha * T;
+			if (COLLECT_IMPORTANCE)
+			{
+				const int gaussian_id = collected_id[j];
+				atomicAdd(&accum_weights[gaussian_id], weight);
+				atomicAdd(&projected_area[gaussian_id], 1);
+				if (weight > max_weight)
+				{
+					max_weight = weight;
+					max_weight_id = gaussian_id;
+				}
+			}
+
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * weight;
 
 			T = test_T;
 
@@ -394,6 +412,9 @@ renderCUDA(
 			last_contributor = contributor;
 		}
 	}
+
+	if (COLLECT_IMPORTANCE && max_weight_id >= 0)
+		atomicAdd(&max_contribution_area[max_weight_id], 1.0f);
 
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
@@ -433,7 +454,7 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS, false> << <grid, block >> > (
 		ranges,
 		point_list,
 		per_tile_bucket_offset,
@@ -449,7 +470,54 @@ void FORWARD::render(
 		max_contrib,
 		n_contrib2loss,
 		bg_color,
-		out_color);
+		out_color,
+		nullptr,
+		nullptr,
+		nullptr);
+}
+
+void FORWARD::render_importance(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	const uint32_t* per_tile_bucket_offset,
+	uint32_t* bucket_to_tile,
+	float* sampled_T,
+	float* sampled_ar,
+	int W, int H,
+	const float2* means2D,
+	const float* colors,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	uint32_t* max_contrib,
+	uint32_t* n_contrib2loss,
+	const float* bg_color,
+	float* out_color,
+	float* accum_weights,
+	int* projected_area,
+	float* max_contribution_area)
+{
+	renderCUDA<NUM_CHANNELS, true> << <grid, block >> > (
+		ranges,
+		point_list,
+		per_tile_bucket_offset,
+		bucket_to_tile,
+		sampled_T,
+		sampled_ar,
+		W, H,
+		means2D,
+		colors,
+		conic_opacity,
+		final_T,
+		n_contrib,
+		max_contrib,
+		n_contrib2loss,
+		bg_color,
+		out_color,
+		accum_weights,
+		projected_area,
+		max_contribution_area);
 }
 
 template <uint32_t CHANNELS>

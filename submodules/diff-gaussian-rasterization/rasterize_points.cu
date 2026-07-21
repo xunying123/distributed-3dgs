@@ -337,11 +337,86 @@ RenderGaussiansCUDA(
 		n_render.contiguous().data<int>(),
 		n_consider.contiguous().data<int>(),
 		n_contrib.contiguous().data<int>(),//output
+		nullptr,
+		nullptr,
+		nullptr,
 		&n_bucket,
 		debug,
 		args);
   }
   return std::make_tuple(rendered, n_bucket, out_color, n_render, n_consider, n_contrib, geomBuffer, binningBuffer, imgBuffer, sampleBuffer);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+RenderGaussiansImportanceCUDA(
+	const torch::Tensor& background,
+	const int image_height,
+	const int image_width,
+	torch::Tensor& means2D,
+	torch::Tensor& depths,
+	torch::Tensor& radii,
+	torch::Tensor& conic_opacity,
+	torch::Tensor& rgb,
+	const torch::Tensor& compute_locally,
+	const bool debug,
+	const pybind11::dict &args)
+{
+	const int P = means2D.size(0);
+	const int H = image_height;
+	const int W = image_width;
+	auto int_opts = means2D.options().dtype(torch::kInt32);
+	auto float_opts = means2D.options().dtype(torch::kFloat32);
+
+	torch::Tensor accum_weights = torch::zeros({P}, float_opts);
+	torch::Tensor projected_area = torch::zeros({P}, int_opts);
+	torch::Tensor max_contribution_area = torch::zeros({P}, float_opts);
+	if (P == 0)
+		return std::make_tuple(accum_weights, projected_area, max_contribution_area);
+
+	torch::Tensor out_color = torch::empty({NUM_CHANNELS, H, W}, float_opts);
+	const int tile_num = ((H + BLOCK_Y - 1) / BLOCK_Y) * ((W + BLOCK_X - 1) / BLOCK_X);
+	torch::Tensor n_render = torch::zeros({tile_num}, int_opts);
+	torch::Tensor n_consider = torch::zeros({tile_num}, int_opts);
+	torch::Tensor n_contrib = torch::zeros({tile_num}, int_opts);
+
+	torch::Device device(torch::kCUDA);
+	torch::TensorOptions options(torch::kByte);
+	torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
+	torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
+	torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+	torch::Tensor sampleBuffer = torch::empty({0}, options.device(device));
+	std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
+	std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
+	std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+	std::function<char*(size_t)> sampleFunc = resizeFunctional(sampleBuffer);
+
+	int n_bucket = 0;
+	CudaRasterizer::Rasterizer::renderForward(
+		geomFunc,
+		binningFunc,
+		imgFunc,
+		sampleFunc,
+		P,
+		background.contiguous().data<float>(),
+		W, H,
+		reinterpret_cast<float2*>(means2D.contiguous().data<float>()),
+		depths.contiguous().data<float>(),
+		radii.contiguous().data<int>(),
+		reinterpret_cast<float4*>(conic_opacity.contiguous().data<float>()),
+		rgb.contiguous().data<float>(),
+		compute_locally.contiguous().data<bool>(),
+		out_color.contiguous().data<float>(),
+		n_render.contiguous().data<int>(),
+		n_consider.contiguous().data<int>(),
+		n_contrib.contiguous().data<int>(),
+		accum_weights.contiguous().data<float>(),
+		projected_area.contiguous().data<int>(),
+		max_contribution_area.contiguous().data<float>(),
+		&n_bucket,
+		debug,
+		args);
+
+	return std::make_tuple(accum_weights, projected_area, max_contribution_area);
 }
 
 std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

@@ -838,6 +838,38 @@ class GaussianModel:
             valid_points_mask
         ]
 
+    def reinitialize_after_mini_splatting(self, global_dist2):
+        """Apply the post-sampling reinitialization from Mini-Splatting."""
+        point_count = self.get_xyz.shape[0]
+        features = torch.zeros(
+            (point_count, 3, (self.max_sh_degree + 1) ** 2),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        features[:, :, 0] = self._features_dc[:, 0, :]
+
+        scales = torch.log(torch.sqrt(torch.clamp_min(global_dist2, 1e-7)))[
+            ..., None
+        ].repeat(1, 3)
+        rotations = torch.zeros((point_count, 4), device="cuda")
+        rotations[:, 0] = 1
+        opacities = inverse_sigmoid(
+            0.1 * torch.ones((point_count, 1), dtype=torch.float32, device="cuda")
+        )
+
+        self._xyz = nn.Parameter(self.get_xyz.detach().requires_grad_(True))
+        self._features_dc = nn.Parameter(
+            features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        self._features_rest = nn.Parameter(
+            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rotations.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.active_sh_degree = 0
+        self.max_radii2D = torch.zeros(point_count, device="cuda")
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:

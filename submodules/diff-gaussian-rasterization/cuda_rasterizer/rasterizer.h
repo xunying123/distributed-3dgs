@@ -129,6 +129,9 @@ namespace CudaRasterizer
 			int* n_render,// TODO: int* could not match with uint32_t*. error may occur, especially when the number is large.
 			int* n_consider,// If your uint32_t array contains values higher than 2,147,483,647, they will overflow when converted to int.
 			int* n_contrib,//array of results for this function. 
+			float* accum_weights,
+			int* projected_area,
+			float* max_contribution_area,
 			int* n_bucket,
 			bool debug,
 			const pybind11::dict &args);

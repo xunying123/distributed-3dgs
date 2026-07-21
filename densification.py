@@ -2,13 +2,24 @@ import torch
 import utils.general_utils as utils
 
 
+def _mini_splatting_allows_densification(iteration, args):
+    return (
+        not args.mini_splatting_pruning
+        or iteration < args.mini_splatting_simp_iteration1
+    )
+
+
 def densification(iteration, scene, gaussians, batched_screenspace_pkg):
     args = utils.get_args()
     timers = utils.get_timers()
     log_file = utils.get_log_file()
 
     # Densification
-    if not args.disable_auto_densification and iteration <= args.densify_until_iter:
+    if (
+        not args.disable_auto_densification
+        and iteration <= args.densify_until_iter
+        and _mini_splatting_allows_densification(iteration, args)
+    ):
         # Keep track of max radii in image-space for pruning
         timers.start("densification")
 
@@ -91,7 +102,11 @@ def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
     log_file = utils.get_log_file()
 
     # Densification
-    if not args.disable_auto_densification and iteration <= args.densify_until_iter:
+    if (
+        not args.disable_auto_densification
+        and iteration <= args.densify_until_iter
+        and _mini_splatting_allows_densification(iteration, args)
+    ):
         # Keep track of max radii in image-space for pruning
         timers.start("densification")
 

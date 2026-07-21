@@ -626,7 +626,7 @@ def all_to_all_communication_final(
             if len(local_to_gpuj_camk_size[j]) == k:
                 local_to_gpuj_camk_size[j].append(0)
                 local_to_gpuj_camk_send_ids[j].append(
-                    torch.empty((0, 1), dtype=torch.int64)
+                    torch.empty((0,), dtype=torch.int64, device="cuda")
                 )
 
     gpui_to_gpuj_imgk_size = torch.zeros(
@@ -781,6 +781,7 @@ def all_to_all_communication_final(
         batched_radii_redistributed,
         batched_depths_redistributed,
         gpui_to_gpuj_imgk_size,
+        local_to_gpuj_camk_send_ids,
     )
 
 
@@ -1101,6 +1102,14 @@ def distributed_preprocess3dgs_and_all2all_final(
             "gpui_to_gpuj_imgk_size": [
                 [[batched_means2D[i].shape[0] for i in range(len(batched_means2D))]]
             ],
+            "local_to_gpuj_camk_send_ids": [
+                [
+                    torch.arange(
+                        batched_means2D[i].shape[0], device="cuda", dtype=torch.long
+                    )
+                    for i in range(len(batched_means2D))
+                ]
+            ],
         }
         return batched_screenspace_pkg
 
@@ -1113,6 +1122,7 @@ def distributed_preprocess3dgs_and_all2all_final(
         batched_radii_redistributed,
         batched_depths_redistributed,
         gpui_to_gpuj_imgk_size,
+        local_to_gpuj_camk_send_ids,
     ) = all_to_all_communication_final(
         batched_rasterizers,
         batched_screenspace_params,
@@ -1139,6 +1149,7 @@ def distributed_preprocess3dgs_and_all2all_final(
         "batched_radii_redistributed": batched_radii_redistributed,
         "batched_depths_redistributed": batched_depths_redistributed,
         "gpui_to_gpuj_imgk_size": gpui_to_gpuj_imgk_size,
+        "local_to_gpuj_camk_send_ids": local_to_gpuj_camk_send_ids,
     }
     return batched_screenspace_pkg
 
@@ -1431,6 +1442,38 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
 
     ########## [END] CUDA Rasterization Call ##########
     return batched_rendered_image, batched_compute_locally
+
+
+def render_mini_splatting_importance(
+    batched_screenspace_pkg, batched_strategies
+):
+    """Return the three per-Gaussian statistics produced by render_imp."""
+    batched_stats = []
+    for cam_id, strategy in enumerate(batched_strategies):
+        means2D = batched_screenspace_pkg["batched_means2D_redistributed"][cam_id]
+        if utils.GLOBAL_RANK not in strategy.gpu_ids or means2D.shape[0] == 0:
+            batched_stats.append(
+                torch.zeros((means2D.shape[0], 3), device="cuda", dtype=torch.float32)
+            )
+            continue
+
+        accum_weights, area_proj, area_max = batched_screenspace_pkg[
+            "batched_rasterizers"
+        ][cam_id].render_gaussians_importance(
+            means2D=means2D,
+            conic_opacity=batched_screenspace_pkg[
+                "batched_conic_opacity_redistributed"
+            ][cam_id],
+            rgb=batched_screenspace_pkg["batched_rgb_redistributed"][cam_id],
+            depths=batched_screenspace_pkg["batched_depths_redistributed"][cam_id],
+            radii=batched_screenspace_pkg["batched_radii_redistributed"][cam_id],
+            compute_locally=strategy.get_compute_locally(),
+            cuda_args=batched_screenspace_pkg["batched_cuda_args"][cam_id],
+        )
+        batched_stats.append(
+            torch.stack((accum_weights, area_proj.float(), area_max), dim=1)
+        )
+    return batched_stats
 
 
 def gsplat_render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):

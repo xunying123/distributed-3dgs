@@ -67,6 +67,28 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color);
 
+	void render_importance(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		const uint32_t* per_tile_bucket_offset,
+		uint32_t* bucket_to_tile,
+		float* sampled_T,
+		float* sampled_ar,
+		int W, int H,
+		const float2* points_xy_image,
+		const float* features,
+		const float4* conic_opacity,
+		float* final_T,
+		uint32_t* n_contrib,
+		uint32_t* max_contrib,
+		uint32_t* n_contrib2loss,
+		const float* bg_color,
+		float* out_color,
+		float* accum_weights,
+		int* projected_area,
+		float* max_contribution_area);
+
 	void render_l1(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,

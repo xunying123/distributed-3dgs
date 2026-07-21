@@ -630,6 +630,9 @@ int CudaRasterizer::Rasterizer::renderForward(
 	int* n_render,// TODO: int* could not match with uint32_t*. error may occur, especially when the number is large.
 	int* n_consider,// If your uint32_t array contains values higher than 2,147,483,647, they will overflow when converted to int.
 	int* n_contrib,//array of results for this function. 
+	float* accum_weights,
+	int* projected_area,
+	float* max_contribution_area,
 	int* n_bucket,
 	bool debug,
 	const pybind11::dict &args)
@@ -741,24 +744,51 @@ int CudaRasterizer::Rasterizer::renderForward(
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = rgb;
 	timer.start("70 render");
-	CHECK_CUDA(FORWARD::render(//TODO: only deal with local tiles. do not even load other tiles.
-		tile_grid, block,
-		imgState.ranges,
-		binningState.point_list,
-		imgState.bucket_offsets,
-		sampleState.bucket_to_tile,
-		sampleState.T,
-		sampleState.ar,
-		width, height,
-		means2D,
-		feature_ptr,
-		conic_opacity,
-		imgState.accum_alpha,
-		imgState.n_contrib,
-		imgState.max_contrib,
-		imgState.n_contrib2loss,
-		background,
-		out_color), debug)
+	if (accum_weights == nullptr)
+	{
+		CHECK_CUDA(FORWARD::render(//TODO: only deal with local tiles. do not even load other tiles.
+			tile_grid, block,
+			imgState.ranges,
+			binningState.point_list,
+			imgState.bucket_offsets,
+			sampleState.bucket_to_tile,
+			sampleState.T,
+			sampleState.ar,
+			width, height,
+			means2D,
+			feature_ptr,
+			conic_opacity,
+			imgState.accum_alpha,
+			imgState.n_contrib,
+			imgState.max_contrib,
+			imgState.n_contrib2loss,
+			background,
+			out_color), debug)
+	}
+	else
+	{
+		CHECK_CUDA(FORWARD::render_importance(
+			tile_grid, block,
+			imgState.ranges,
+			binningState.point_list,
+			imgState.bucket_offsets,
+			sampleState.bucket_to_tile,
+			sampleState.T,
+			sampleState.ar,
+			width, height,
+			means2D,
+			feature_ptr,
+			conic_opacity,
+			imgState.accum_alpha,
+			imgState.n_contrib,
+			imgState.max_contrib,
+			imgState.n_contrib2loss,
+			background,
+			out_color,
+			accum_weights,
+			projected_area,
+			max_contribution_area), debug)
+	}
 	timer.stop("70 render");
 	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHANNELS, cudaMemcpyDeviceToDevice), debug);
 

@@ -27,6 +27,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 import torch.distributed as dist
 from densification import densification, gsplat_densification
+from mini_splatting import run_mini_splatting_pruning
 
 
 START_NSIGHT_PROFILE_AFTER_ITERATION = 99900
@@ -96,6 +97,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     ema_loss_for_log = 0
     nsight_profile_started = False
+    completed_mini_splatting_stages = set()
     for iteration in range(
         start_from_this_iteration, opt_args.iterations + 1, args.bsz
     ):
@@ -104,7 +106,16 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
         progress_bar.update(args.bsz)
         utils.set_cur_iter(iteration)
-        gaussians.update_learning_rate(iteration)
+        learning_rate_iteration = iteration
+        if (
+            args.mini_splatting_pruning
+            and iteration >= args.mini_splatting_simp_iteration1
+        ):
+            learning_rate_iteration = (
+                iteration - args.mini_splatting_simp_iteration1 + 5000
+            )
+        gaussians.update_learning_rate(learning_rate_iteration)
+        mini_splatting_pruned_this_iteration = False
         num_trained_batches += 1
         timers.clear()
 
@@ -277,6 +288,29 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             else:
                 densification(iteration, scene, gaussians, batched_screenspace_pkg)
 
+            if args.mini_splatting_pruning:
+                mini_splatting_stages = [
+                    ("sample", args.mini_splatting_simp_iteration1),
+                    ("prune", args.mini_splatting_simp_iteration2),
+                ]
+                for stage, target_iteration in mini_splatting_stages:
+                    if (
+                        stage not in completed_mini_splatting_stages
+                        and iteration <= target_iteration < iteration + args.bsz
+                    ):
+                        run_mini_splatting_pruning(
+                            target_iteration,
+                            stage,
+                            train_dataset,
+                            gaussians,
+                            pipe_args,
+                            opt_args,
+                            background,
+                            strategy_history,
+                        )
+                        completed_mini_splatting_stages.add(stage)
+                        mini_splatting_pruned_this_iteration = True
+
             # Save Gaussians
             if any(
                 [
@@ -335,27 +369,27 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             if iteration < opt_args.iterations:
                 timers.start("optimizer_step")
 
-                if (
-                    args.lr_scale_mode != "accumu"
-                ):  # we scale the learning rate rather than accumulate the gradients.
-                    for param in gaussians.all_parameters():
-                        if param.grad is not None:
-                            param.grad /= args.bsz
+                if mini_splatting_pruned_this_iteration:
+                    gaussians.optimizer.zero_grad(set_to_none=True)
+                else:
+                    if (
+                        args.lr_scale_mode != "accumu"
+                    ):  # we scale the learning rate rather than accumulate the gradients.
+                        for param in gaussians.all_parameters():
+                            if param.grad is not None:
+                                param.grad /= args.bsz
 
-                # if not args.stop_update_param:
-                #     gaussians.optimizer.step()
-                
-                if not args.stop_update_param:
-                    if args.sparse_adam:
-                        visibility_list = batched_screenspace_pkg[
-                            "batched_locally_preprocessed_visibility_filter"
-                        ]
-                        visibility_filter = torch.stack(visibility_list).any(dim=0)
-                        N = gaussians.get_xyz.shape[0]
-                        gaussians.optimizer.step(visibility_filter, N)
-                    else:
-                        gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none=True)
+                    if not args.stop_update_param:
+                        if args.sparse_adam:
+                            visibility_list = batched_screenspace_pkg[
+                                "batched_locally_preprocessed_visibility_filter"
+                            ]
+                            visibility_filter = torch.stack(visibility_list).any(dim=0)
+                            N = gaussians.get_xyz.shape[0]
+                            gaussians.optimizer.step(visibility_filter, N)
+                        else:
+                            gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad(set_to_none=True)
                 timers.stop("optimizer_step")
                 utils.check_initial_gpu_memory_usage("after optimizer step")
 
