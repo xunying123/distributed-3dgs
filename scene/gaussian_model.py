@@ -58,6 +58,7 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
+        self.sum_visible_count_in_one_batch = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(
             0
         )  # TODO: deal with self.send_to_gpui_cnt
@@ -246,6 +247,9 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.sum_visible_count_in_one_batch = torch.zeros(
+            self.get_xyz.shape[0], device="cuda"
+        )
         self.reset_blur_split_stats()
 
         shard_world_size = self.group_for_redistribution().size()
@@ -836,9 +840,11 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.sum_visible_count_in_one_batch = self.sum_visible_count_in_one_batch[
-            valid_points_mask
-        ]
+        # This legacy counter is not accumulated anywhere. Recreate it instead of
+        # indexing potentially stale state left by a model reinitialization.
+        self.sum_visible_count_in_one_batch = torch.zeros(
+            self.get_xyz.shape[0], device="cuda"
+        )
 
     def reinitialize_after_mini_splatting(self, global_dist2):
         """Apply the post-sampling reinitialization from Mini-Splatting."""
@@ -871,6 +877,9 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.active_sh_degree = 0
         self.max_radii2D = torch.zeros(point_count, device="cuda")
+        self.sum_visible_count_in_one_batch = torch.zeros(
+            point_count, device="cuda"
+        )
 
     def reinitialize_from_mini_splatting_depth(self, xyz, rgb, global_dist2):
         """Replace the model with points sampled by depth reinitialization."""
@@ -902,6 +911,9 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.active_sh_degree = 0
         self.max_radii2D = torch.zeros(point_count, device="cuda")
+        self.sum_visible_count_in_one_batch = torch.zeros(
+            point_count, device="cuda"
+        )
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}

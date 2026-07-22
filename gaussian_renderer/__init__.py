@@ -567,10 +567,13 @@ def get_cuda_args_final(strategy, mode="train"):
     iteration = utils.get_cur_iter()
     collect_blur_stats = (
         mode == "train"
-        and args.mini_splatting_pruning
+        and args.mini_splatting_enable_blur_split
         and not args.disable_auto_densification
         and iteration <= args.densify_until_iter
-        and iteration < args.mini_splatting_simp_iteration1
+        and (
+            not args.mini_splatting_enable_simplification
+            or iteration < args.mini_splatting_simp_iteration1
+        )
     )
 
     if mode == "train":

@@ -111,7 +111,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         utils.set_cur_iter(iteration)
         learning_rate_iteration = iteration
         if (
-            args.mini_splatting_pruning
+            args.mini_splatting_enable_simplification
             and iteration >= args.mini_splatting_simp_iteration1
         ):
             learning_rate_iteration = (
@@ -134,7 +134,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             nvtx.range_push(f"iteration[{iteration},{iteration+args.bsz})")
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if (
-            not args.mini_splatting_pruning
+            not args.mini_splatting_enable_simplification
             or iteration > args.mini_splatting_simp_iteration1
         ) and utils.check_update_at_this_iter(iteration, args.bsz, 1000, 0):
             gaussians.oneupSHdegree()
@@ -294,11 +294,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             else:
                 densification(iteration, scene, gaussians, batched_screenspace_pkg)
 
-            if args.mini_splatting_pruning:
-                depth_limit = min(
-                    args.densify_until_iter,
-                    args.mini_splatting_simp_iteration1,
-                )
+            if args.mini_splatting_enable_depth_reinitialization:
+                depth_limit = args.densify_until_iter
+                if args.mini_splatting_enable_simplification:
+                    depth_limit = min(
+                        depth_limit,
+                        args.mini_splatting_simp_iteration1,
+                    )
                 depth_targets = range(
                     args.mini_splatting_depth_reinitialization_interval,
                     depth_limit,
@@ -322,6 +324,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         completed_mini_splatting_stages.add(stage)
                         mini_splatting_pruned_this_iteration = True
 
+            if args.mini_splatting_enable_simplification:
                 mini_splatting_stages = [
                     ("sample", args.mini_splatting_simp_iteration1),
                     ("prune", args.mini_splatting_simp_iteration2),

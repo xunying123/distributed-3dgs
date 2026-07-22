@@ -133,6 +133,9 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.min_opacity = 0.005
         self.mini_splatting_pruning = False
+        self.mini_splatting_enable_simplification = False
+        self.mini_splatting_enable_depth_reinitialization = False
+        self.mini_splatting_enable_blur_split = False
         self.mini_splatting_simp_iteration1 = 15_000
         self.mini_splatting_simp_iteration2 = 20_000
         self.mini_splatting_sampling_factor = 0.5
@@ -295,6 +298,18 @@ def init_args(args):
         )
 
     args.mini_splatting_imp_metric = args.mini_splatting_imp_metric.strip().lower()
+    mini_splatting_module_flags = (
+        args.mini_splatting_enable_simplification,
+        args.mini_splatting_enable_depth_reinitialization,
+        args.mini_splatting_enable_blur_split,
+    )
+    if args.mini_splatting_pruning and not any(mini_splatting_module_flags):
+        args.mini_splatting_enable_simplification = True
+        args.mini_splatting_enable_depth_reinitialization = True
+        args.mini_splatting_enable_blur_split = True
+    elif any(mini_splatting_module_flags):
+        args.mini_splatting_pruning = True
+
     if args.mini_splatting_pruning:
         if args.backend != "default":
             raise ValueError("--mini_splatting_pruning requires --backend default")

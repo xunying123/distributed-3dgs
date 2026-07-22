@@ -4,7 +4,7 @@ import utils.general_utils as utils
 
 def _accumulate_mini_splatting_blur_stats(gaussians, screenspace_pkg):
     args = utils.get_args()
-    if not args.mini_splatting_pruning:
+    if not args.mini_splatting_enable_blur_split:
         return
 
     group = utils.DEFAULT_GROUP
@@ -81,16 +81,19 @@ def _accumulate_mini_splatting_blur_stats(gaussians, screenspace_pkg):
 
 def _mini_splatting_allows_densification(iteration, args):
     return (
-        not args.mini_splatting_pruning
+        not args.mini_splatting_enable_simplification
         or iteration < args.mini_splatting_simp_iteration1
     )
 
 
 def _mini_splatting_depth_reinitializes(iteration, args):
     return (
-        args.mini_splatting_pruning
+        args.mini_splatting_enable_depth_reinitialization
         and iteration < args.densify_until_iter
-        and iteration < args.mini_splatting_simp_iteration1
+        and (
+            not args.mini_splatting_enable_simplification
+            or iteration < args.mini_splatting_simp_iteration1
+        )
         and utils.check_update_at_this_iter(
             iteration,
             args.bsz,
@@ -150,7 +153,7 @@ def densification(iteration, scene, gaussians, batched_screenspace_pkg):
                 size_threshold,
                 force_split_mask=(
                     gaussians.mini_splatting_blur_mask
-                    if args.mini_splatting_pruning
+                    if args.mini_splatting_enable_blur_split
                     else None
                 ),
             )
