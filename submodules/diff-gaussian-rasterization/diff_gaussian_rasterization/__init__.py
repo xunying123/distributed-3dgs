@@ -215,6 +215,7 @@ def render_gaussians_importance(
     depths,
     radii,
     compute_locally,
+    tile_budget,
     raster_settings,
     cuda_args,
 ):
@@ -228,6 +229,7 @@ def render_gaussians_importance(
         conic_opacity,
         rgb,
         compute_locally,
+        int(tile_budget),
         raster_settings.debug,
         cuda_args,
     )
@@ -684,6 +686,7 @@ class GaussianRasterizer(nn.Module):
         depths,
         radii,
         compute_locally,
+        tile_budget=0,
         cuda_args=None,
     ):
         return render_gaussians_importance(
@@ -693,6 +696,7 @@ class GaussianRasterizer(nn.Module):
             depths,
             radii,
             compute_locally,
+            tile_budget,
             self.raster_settings,
             cuda_args,
         )

@@ -360,7 +360,7 @@ RenderGaussiansCUDA(
     max_contribution_area, geomBuffer, binningBuffer, imgBuffer, sampleBuffer);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansImportanceCUDA(
 	const torch::Tensor& background,
 	const int image_height,
@@ -371,6 +371,7 @@ RenderGaussiansImportanceCUDA(
 	torch::Tensor& conic_opacity,
 	torch::Tensor& rgb,
 	const torch::Tensor& compute_locally,
+	const int tile_budget,
 	const bool debug,
 	const pybind11::dict &args)
 {
@@ -383,12 +384,16 @@ RenderGaussiansImportanceCUDA(
 	torch::Tensor accum_weights = torch::zeros({P}, float_opts);
 	torch::Tensor projected_area = torch::zeros({P}, int_opts);
 	torch::Tensor max_contribution_area = torch::zeros({P}, float_opts);
-	if (P == 0)
-		return std::make_tuple(accum_weights, projected_area, max_contribution_area);
-
-	torch::Tensor out_color = torch::empty({NUM_CHANNELS, H, W}, float_opts);
+	torch::Tensor overload_pressure = torch::zeros({P}, float_opts);
+	torch::Tensor overloaded_touches = torch::zeros({P}, float_opts);
 	const int tile_num = ((H + BLOCK_Y - 1) / BLOCK_Y) * ((W + BLOCK_X - 1) / BLOCK_X);
 	torch::Tensor n_render = torch::zeros({tile_num}, int_opts);
+	if (P == 0)
+		return std::make_tuple(
+			accum_weights, projected_area, max_contribution_area,
+			overload_pressure, overloaded_touches, n_render);
+
+	torch::Tensor out_color = torch::empty({NUM_CHANNELS, H, W}, float_opts);
 	torch::Tensor n_consider = torch::zeros({tile_num}, int_opts);
 	torch::Tensor n_contrib = torch::zeros({tile_num}, int_opts);
 
@@ -404,7 +409,7 @@ RenderGaussiansImportanceCUDA(
 	std::function<char*(size_t)> sampleFunc = resizeFunctional(sampleBuffer);
 
 	int n_bucket = 0;
-	CudaRasterizer::Rasterizer::renderForward(
+	const int rendered = CudaRasterizer::Rasterizer::renderForward(
 		geomFunc,
 		binningFunc,
 		imgFunc,
@@ -435,8 +440,19 @@ RenderGaussiansImportanceCUDA(
 		&n_bucket,
 		debug,
 		args);
+	CudaRasterizer::Rasterizer::collectTileOverloadStats(
+		rendered,
+		W, H,
+		reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
+		reinterpret_cast<char*>(imgBuffer.contiguous().data_ptr()),
+		tile_budget,
+		overload_pressure.contiguous().data<float>(),
+		overloaded_touches.contiguous().data<float>(),
+		debug);
 
-	return std::make_tuple(accum_weights, projected_area, max_contribution_area);
+	return std::make_tuple(
+		accum_weights, projected_area, max_contribution_area,
+		overload_pressure, overloaded_touches, n_render);
 }
 
 std::tuple<torch::Tensor, torch::Tensor>

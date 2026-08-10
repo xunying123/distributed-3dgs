@@ -143,6 +143,16 @@ namespace CudaRasterizer
 			bool debug,
 			const pybind11::dict &args);
 
+		static void collectTileOverloadStats(
+			const int R,
+			const int width, int height,
+			char* binning_buffer,
+			char* image_buffer,
+			const int tile_budget,
+			float* overload_pressure,
+			float* overloaded_touches,
+			bool debug);
+
 		static int renderForwardL1(
 			std::function<char* (size_t)> geometryBuffer,
 			std::function<char* (size_t)> binningBuffer,

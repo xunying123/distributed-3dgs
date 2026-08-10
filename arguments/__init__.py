@@ -142,6 +142,9 @@ class OptimizationParams(ParamGroup):
         self.mini_splatting_second_keep_mass = 0.99
         self.mini_splatting_imp_metric = "outdoor"
         self.mini_splatting_seed = 0
+        self.mini_splatting_tile_budget = 0
+        self.mini_splatting_tile_prune_max_rounds = 3
+        self.mini_splatting_tile_prune_max_fraction = 0.1
         self.mini_splatting_blur_threshold = 2e-4
         self.mini_splatting_depth_reinitialization_interval = 5000
         self.mini_splatting_num_depth = 3_500_000
@@ -298,6 +301,8 @@ def init_args(args):
         )
 
     args.mini_splatting_imp_metric = args.mini_splatting_imp_metric.strip().lower()
+    if args.mini_splatting_tile_budget > 0:
+        args.mini_splatting_enable_simplification = True
     mini_splatting_module_flags = (
         args.mini_splatting_enable_simplification,
         args.mini_splatting_enable_depth_reinitialization,
@@ -333,6 +338,21 @@ def init_args(args):
             raise ValueError("--mini_splatting_sampling_factor must be in (0, 1]")
         if not 0.0 < args.mini_splatting_second_keep_mass <= 1.0:
             raise ValueError("--mini_splatting_second_keep_mass must be in (0, 1]")
+        if args.mini_splatting_tile_budget < 0:
+            raise ValueError("--mini_splatting_tile_budget must be non-negative")
+        if args.mini_splatting_tile_budget > utils.BLOCK_X * utils.BLOCK_Y:
+            raise ValueError(
+                "--mini_splatting_tile_budget cannot exceed the rasterizer "
+                "block capacity ({})".format(utils.BLOCK_X * utils.BLOCK_Y)
+            )
+        if args.mini_splatting_tile_prune_max_rounds < 0:
+            raise ValueError(
+                "--mini_splatting_tile_prune_max_rounds must be non-negative"
+            )
+        if not 0.0 < args.mini_splatting_tile_prune_max_fraction <= 1.0:
+            raise ValueError(
+                "--mini_splatting_tile_prune_max_fraction must be in (0, 1]"
+            )
         if args.mini_splatting_imp_metric not in ("outdoor", "indoor"):
             raise ValueError(
                 "--mini_splatting_imp_metric must be 'outdoor' or 'indoor'"

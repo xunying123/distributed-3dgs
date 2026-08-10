@@ -147,7 +147,7 @@ RenderGaussiansCUDA(
 	const bool debug,
 	const pybind11::dict &args);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansImportanceCUDA(
 	const torch::Tensor& background,
 	const int image_height,
@@ -158,6 +158,7 @@ RenderGaussiansImportanceCUDA(
 	torch::Tensor& conic_opacity,
 	torch::Tensor& rgb,
 	const torch::Tensor& compute_locally,
+	const int tile_budget,
 	const bool debug,
 	const pybind11::dict &args);
 

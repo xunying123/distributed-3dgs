@@ -783,6 +783,7 @@ renderL1CUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_features[CHANNELS * BLOCK_SIZE];
 	__shared__ float s_x[BLOCK_SIZE];
 	__shared__ float s_y[BLOCK_SIZE];
 	__shared__ float s_x2[BLOCK_SIZE];
@@ -810,6 +811,9 @@ renderL1CUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			for (int ch = 0; ch < CHANNELS; ++ch)
+				collected_features[ch * BLOCK_SIZE + block.thread_rank()] =
+					features[coll_id * CHANNELS + ch];
 		}
 		block.sync();
 
@@ -850,7 +854,7 @@ renderL1CUDA(
 				max_weight_id = collected_id[j];
 			}
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * weight;
+				C[ch] += collected_features[ch * BLOCK_SIZE + j] * weight;
 
 			T = test_T;
 			last_contributor = contributor;

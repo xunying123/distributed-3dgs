@@ -326,6 +326,63 @@ __global__ void get_n_render(
 	n_render[idx] = ranges[idx].y - ranges[idx].x;
 }
 
+__global__ void accumulateTileOverloadStats(
+	const int R,
+	const uint64_t* point_list_keys,
+	const uint32_t* point_list,
+	const uint2* ranges,
+	const int tile_budget,
+	float* overload_pressure,
+	float* overloaded_touches)
+{
+	const int idx = cg::this_grid().thread_rank();
+	if (idx >= R)
+		return;
+
+	const uint32_t tile_id = static_cast<uint32_t>(point_list_keys[idx] >> 32);
+	const uint2 range = ranges[tile_id];
+	const int tile_count = static_cast<int>(range.y - range.x);
+	if (tile_count <= tile_budget)
+		return;
+
+	const uint32_t gaussian_id = point_list[idx];
+	const float normalized_overflow =
+		static_cast<float>(tile_count - tile_budget) / static_cast<float>(tile_count);
+	atomicAdd(&overload_pressure[gaussian_id], normalized_overflow);
+	atomicAdd(&overloaded_touches[gaussian_id], 1.0f);
+}
+
+void CudaRasterizer::Rasterizer::collectTileOverloadStats(
+	const int R,
+	const int width, int height,
+	char* binning_buffer,
+	char* image_buffer,
+	const int tile_budget,
+	float* overload_pressure,
+	float* overloaded_touches,
+	bool debug)
+{
+	if (R <= 0 || tile_budget <= 0)
+		return;
+
+	char* binning_chunkptr = binning_buffer;
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, R);
+	char* image_chunkptr = image_buffer;
+	ImageState imageState = ImageState::fromChunk(image_chunkptr, width * height);
+
+	accumulateTileOverloadStats<<<
+		(R + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE,
+		ONE_DIM_BLOCK_SIZE>>>(
+		R,
+		binningState.point_list_keys,
+		binningState.point_list,
+		imageState.ranges,
+		tile_budget,
+		overload_pressure,
+		overloaded_touches);
+	CHECK_CUDA(, debug)
+}
+
 __global__ void reduce_data_per_block(
 	const int width,
 	const int height,

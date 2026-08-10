@@ -1477,19 +1477,38 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
 
 
 def render_mini_splatting_importance(
-    batched_screenspace_pkg, batched_strategies
+    batched_screenspace_pkg, batched_strategies, tile_budget=0
 ):
-    """Return the three per-Gaussian statistics produced by render_imp."""
+    """Return importance and tile-overload statistics produced by render_imp."""
     batched_stats = []
+    batched_n_render = []
     for cam_id, strategy in enumerate(batched_strategies):
         means2D = batched_screenspace_pkg["batched_means2D_redistributed"][cam_id]
         if utils.GLOBAL_RANK not in strategy.gpu_ids or means2D.shape[0] == 0:
             batched_stats.append(
-                torch.zeros((means2D.shape[0], 3), device="cuda", dtype=torch.float32)
+                torch.zeros((means2D.shape[0], 5), device="cuda", dtype=torch.float32)
+            )
+            rasterizer = batched_screenspace_pkg["batched_rasterizers"][cam_id]
+            tile_count = (
+                (rasterizer.raster_settings.image_height + utils.BLOCK_Y - 1)
+                // utils.BLOCK_Y
+            ) * (
+                (rasterizer.raster_settings.image_width + utils.BLOCK_X - 1)
+                // utils.BLOCK_X
+            )
+            batched_n_render.append(
+                torch.zeros(tile_count, device="cuda", dtype=torch.int32)
             )
             continue
 
-        accum_weights, area_proj, area_max = batched_screenspace_pkg[
+        (
+            accum_weights,
+            area_proj,
+            area_max,
+            overload_pressure,
+            overloaded_touches,
+            n_render,
+        ) = batched_screenspace_pkg[
             "batched_rasterizers"
         ][cam_id].render_gaussians_importance(
             means2D=means2D,
@@ -1500,12 +1519,23 @@ def render_mini_splatting_importance(
             depths=batched_screenspace_pkg["batched_depths_redistributed"][cam_id],
             radii=batched_screenspace_pkg["batched_radii_redistributed"][cam_id],
             compute_locally=strategy.get_compute_locally(),
+            tile_budget=tile_budget,
             cuda_args=batched_screenspace_pkg["batched_cuda_args"][cam_id],
         )
         batched_stats.append(
-            torch.stack((accum_weights, area_proj.float(), area_max), dim=1)
+            torch.stack(
+                (
+                    accum_weights,
+                    area_proj.float(),
+                    area_max,
+                    overload_pressure,
+                    overloaded_touches,
+                ),
+                dim=1,
+            )
         )
-    return batched_stats
+        batched_n_render.append(n_render)
+    return batched_stats, batched_n_render
 
 
 def render_mini_splatting_depth(
