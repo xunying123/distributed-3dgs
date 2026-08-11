@@ -145,6 +145,7 @@ namespace CudaRasterizer
 
 		static void collectTileOverloadStats(
 			const int R,
+			const int P,
 			const int width, int height,
 			char* binning_buffer,
 			char* image_buffer,

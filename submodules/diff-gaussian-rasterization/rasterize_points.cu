@@ -442,6 +442,7 @@ RenderGaussiansImportanceCUDA(
 		args);
 	CudaRasterizer::Rasterizer::collectTileOverloadStats(
 		rendered,
+		P,
 		W, H,
 		reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 		reinterpret_cast<char*>(imgBuffer.contiguous().data_ptr()),

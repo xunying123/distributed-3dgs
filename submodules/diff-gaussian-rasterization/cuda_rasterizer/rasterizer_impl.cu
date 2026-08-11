@@ -327,33 +327,43 @@ __global__ void get_n_render(
 }
 
 __global__ void accumulateTileOverloadStats(
+	const int tile_num,
 	const int R,
-	const uint64_t* point_list_keys,
+	const int P,
 	const uint32_t* point_list,
 	const uint2* ranges,
 	const int tile_budget,
 	float* overload_pressure,
 	float* overloaded_touches)
 {
-	const int idx = cg::this_grid().thread_rank();
-	if (idx >= R)
+	const int tile_id = blockIdx.x;
+	if (tile_id >= tile_num)
 		return;
 
-	const uint32_t tile_id = static_cast<uint32_t>(point_list_keys[idx] >> 32);
 	const uint2 range = ranges[tile_id];
+	if (range.x > range.y || range.y > static_cast<uint32_t>(R))
+		return;
 	const int tile_count = static_cast<int>(range.y - range.x);
 	if (tile_count <= tile_budget)
 		return;
 
-	const uint32_t gaussian_id = point_list[idx];
 	const float normalized_overflow =
 		static_cast<float>(tile_count - tile_budget) / static_cast<float>(tile_count);
-	atomicAdd(&overload_pressure[gaussian_id], normalized_overflow);
-	atomicAdd(&overloaded_touches[gaussian_id], 1.0f);
+	for (uint32_t list_idx = range.x + threadIdx.x;
+		 list_idx < range.y;
+		 list_idx += blockDim.x)
+	{
+		const uint32_t gaussian_id = point_list[list_idx];
+		if (gaussian_id >= static_cast<uint32_t>(P))
+			continue;
+		atomicAdd(&overload_pressure[gaussian_id], normalized_overflow);
+		atomicAdd(&overloaded_touches[gaussian_id], 1.0f);
+	}
 }
 
 void CudaRasterizer::Rasterizer::collectTileOverloadStats(
 	const int R,
+	const int P,
 	const int width, int height,
 	char* binning_buffer,
 	char* image_buffer,
@@ -362,19 +372,22 @@ void CudaRasterizer::Rasterizer::collectTileOverloadStats(
 	float* overloaded_touches,
 	bool debug)
 {
-	if (R <= 0 || tile_budget <= 0)
+	if (R <= 0 || P <= 0 || tile_budget <= 0)
 		return;
 
+	const int tile_num =
+		((width + BLOCK_X - 1) / BLOCK_X) * ((height + BLOCK_Y - 1) / BLOCK_Y);
 	char* binning_chunkptr = binning_buffer;
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, R);
 	char* image_chunkptr = image_buffer;
 	ImageState imageState = ImageState::fromChunk(image_chunkptr, width * height);
 
 	accumulateTileOverloadStats<<<
-		(R + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE,
+		tile_num,
 		ONE_DIM_BLOCK_SIZE>>>(
+		tile_num,
 		R,
-		binningState.point_list_keys,
+		P,
 		binningState.point_list,
 		imageState.ranges,
 		tile_budget,

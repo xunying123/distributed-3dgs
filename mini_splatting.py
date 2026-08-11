@@ -111,7 +111,23 @@ def _route_stats_to_owners(
         ids = local_send_ids[renderer][0].to(
             device="cuda", dtype=torch.long
         ).flatten()
+        if recv[renderer].shape[0] != ids.numel():
+            raise RuntimeError(
+                "Mini-Splatting owner routing size mismatch for renderer {}: "
+                "ids={} stats={}".format(
+                    renderer, ids.numel(), recv[renderer].shape[0]
+                )
+            )
         if ids.numel() > 0:
+            min_id = int(ids.min().item())
+            max_id = int(ids.max().item())
+            if min_id < 0 or max_id >= owner_stats.shape[0]:
+                raise RuntimeError(
+                    "Mini-Splatting owner routing produced invalid Gaussian IDs "
+                    "for renderer {}: range=[{}, {}], local_count={}".format(
+                        renderer, min_id, max_id, owner_stats.shape[0]
+                    )
+                )
             owner_stats.index_add_(0, ids, recv[renderer])
 
     view_has_max = owner_stats[:, 2] != 0
@@ -139,11 +155,7 @@ def _collect_importance(
     area_max = torch.zeros_like(importance)
     overload_pressure = torch.zeros_like(importance)
     overloaded_touches = torch.zeros_like(importance)
-    local_active_tiles = 0
-    local_overloaded_tiles = 0
-    local_excess_instances = 0
-    local_intersections = 0
-    local_max_occupancy = 0
+    local_tile_occupancies = []
 
     for camera in train_dataset.cameras:
         strategies, _ = start_strategy_final([camera], strategy_history)
@@ -171,16 +183,19 @@ def _collect_importance(
             args.mini_splatting_imp_metric,
         )
         if tile_budget > 0 and n_render.numel() > 0:
-            local_active_tiles += int((n_render > 0).sum().item())
-            overloaded = n_render > tile_budget
-            local_overloaded_tiles += int(overloaded.sum().item())
-            local_excess_instances += int(
-                torch.clamp_min(n_render - tile_budget, 0).sum().item()
-            )
-            local_intersections += int(n_render.sum().item())
-            local_max_occupancy = max(
-                local_max_occupancy, int(n_render.max().item())
-            )
+            compute_locally = strategies[0].get_compute_locally()
+            if compute_locally is not None:
+                compute_locally = compute_locally.flatten()
+                if compute_locally.numel() != n_render.numel():
+                    raise RuntimeError(
+                        "Mini-Splatting tile statistics shape mismatch: "
+                        "mask={} occupancy={}".format(
+                            compute_locally.numel(), n_render.numel()
+                        )
+                    )
+                local_tile_occupancies.append(
+                    n_render.flatten()[compute_locally].contiguous()
+                )
         del (
             batched_stats,
             batched_n_render,
@@ -191,36 +206,125 @@ def _collect_importance(
 
     importance[area_max == 0] = 0
     tile_summary = {
+        "total_tiles": 0,
         "active_tiles": 0,
+        "empty_tiles": 0,
         "overloaded_tiles": 0,
         "excess_instances": 0,
         "intersections": 0,
         "max_occupancy": 0,
+        "mean_occupancy": 0.0,
+        "mean_active_occupancy": 0.0,
+        "mean_overloaded_occupancy": 0.0,
+        "overloaded_ratio": 0.0,
+        "p50_occupancy": 0,
+        "p90_occupancy": 0,
+        "p95_occupancy": 0,
+        "p99_occupancy": 0,
     }
     if tile_budget > 0:
-        summed = torch.tensor(
-            [
-                local_active_tiles,
-                local_overloaded_tiles,
-                local_excess_instances,
-                local_intersections,
-            ],
-            dtype=torch.long,
-            device="cuda",
+        local_occupancies = (
+            torch.cat(local_tile_occupancies)
+            if local_tile_occupancies
+            else torch.empty(0, dtype=torch.int32, device="cuda")
         )
-        maximum = torch.tensor(
-            [local_max_occupancy], dtype=torch.long, device="cuda"
+        occupancy_counts = _counts(local_occupancies.numel())
+        global_occupancies = _gather_to_rank0(
+            local_occupancies, occupancy_counts
         )
+
+        integer_stats = torch.zeros(11, dtype=torch.long, device="cuda")
+        float_stats = torch.zeros(4, dtype=torch.float64, device="cuda")
+        if utils.DEFAULT_GROUP.rank() == 0:
+            total_tiles = global_occupancies.numel()
+            active_occupancies = global_occupancies[global_occupancies > 0]
+            overloaded_occupancies = global_occupancies[
+                global_occupancies > tile_budget
+            ]
+            active_tiles = active_occupancies.numel()
+            overloaded_tiles = overloaded_occupancies.numel()
+
+            percentile_values = torch.zeros(
+                4, dtype=torch.long, device="cuda"
+            )
+            if active_tiles > 0:
+                sorted_active = torch.sort(active_occupancies).values
+                percentile_positions = torch.tensor(
+                    [
+                        round(0.50 * (active_tiles - 1)),
+                        round(0.90 * (active_tiles - 1)),
+                        round(0.95 * (active_tiles - 1)),
+                        round(0.99 * (active_tiles - 1)),
+                    ],
+                    dtype=torch.long,
+                    device="cuda",
+                )
+                percentile_values = sorted_active[percentile_positions].long()
+
+            integer_stats = torch.cat(
+                (
+                    torch.tensor(
+                        [
+                            total_tiles,
+                            active_tiles,
+                            total_tiles - active_tiles,
+                            overloaded_tiles,
+                            int(
+                                torch.clamp_min(
+                                    global_occupancies - tile_budget, 0
+                                ).sum().item()
+                            ),
+                            int(global_occupancies.sum().item()),
+                            int(global_occupancies.max().item())
+                            if total_tiles > 0
+                            else 0,
+                        ],
+                        dtype=torch.long,
+                        device="cuda",
+                    ),
+                    percentile_values,
+                )
+            )
+            float_stats = torch.tensor(
+                [
+                    float(global_occupancies.float().mean().item())
+                    if total_tiles > 0
+                    else 0.0,
+                    float(active_occupancies.float().mean().item())
+                    if active_tiles > 0
+                    else 0.0,
+                    float(overloaded_occupancies.float().mean().item())
+                    if overloaded_tiles > 0
+                    else 0.0,
+                    100.0 * overloaded_tiles / active_tiles
+                    if active_tiles > 0
+                    else 0.0,
+                ],
+                dtype=torch.float64,
+                device="cuda",
+            )
         if utils.DEFAULT_GROUP.size() > 1:
-            dist.all_reduce(summed, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP)
-            dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=utils.DEFAULT_GROUP)
-        values = summed.cpu().tolist()
+            dist.broadcast(integer_stats, src=0, group=utils.DEFAULT_GROUP)
+            dist.broadcast(float_stats, src=0, group=utils.DEFAULT_GROUP)
+
+        integer_values = integer_stats.cpu().tolist()
+        float_values = float_stats.cpu().tolist()
         tile_summary = {
-            "active_tiles": int(values[0]),
-            "overloaded_tiles": int(values[1]),
-            "excess_instances": int(values[2]),
-            "intersections": int(values[3]),
-            "max_occupancy": int(maximum.item()),
+            "total_tiles": int(integer_values[0]),
+            "active_tiles": int(integer_values[1]),
+            "empty_tiles": int(integer_values[2]),
+            "overloaded_tiles": int(integer_values[3]),
+            "excess_instances": int(integer_values[4]),
+            "intersections": int(integer_values[5]),
+            "max_occupancy": int(integer_values[6]),
+            "p50_occupancy": int(integer_values[7]),
+            "p90_occupancy": int(integer_values[8]),
+            "p95_occupancy": int(integer_values[9]),
+            "p99_occupancy": int(integer_values[10]),
+            "mean_occupancy": float(float_values[0]),
+            "mean_active_occupancy": float(float_values[1]),
+            "mean_overloaded_occupancy": float(float_values[2]),
+            "overloaded_ratio": float(float_values[3]),
         }
     return importance, overload_pressure, overloaded_touches, tile_summary
 
@@ -628,15 +732,30 @@ def _enforce_tile_budget(
         )
         message = (
             "Mini-Splatting tile check after {} at iteration {} round {}: "
-            "budget={} max={} overloaded={}/{} excess={} intersections={}\n"
+            "budget={} total_tiles={} active={} empty={} "
+            "avg_all={:.2f} avg_active={:.2f} "
+            "p50={} p90={} p95={} p99={} max={} "
+            "overloaded={}/{} ({:.2f}%) avg_overloaded={:.2f} "
+            "excess={} intersections={}\n"
         ).format(
             stage,
             iteration,
             round_index,
             budget,
+            summary["total_tiles"],
+            summary["active_tiles"],
+            summary["empty_tiles"],
+            summary["mean_occupancy"],
+            summary["mean_active_occupancy"],
+            summary["p50_occupancy"],
+            summary["p90_occupancy"],
+            summary["p95_occupancy"],
+            summary["p99_occupancy"],
             summary["max_occupancy"],
             summary["overloaded_tiles"],
             summary["active_tiles"],
+            summary["overloaded_ratio"],
+            summary["mean_overloaded_occupancy"],
             summary["excess_instances"],
             summary["intersections"],
         )
