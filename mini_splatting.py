@@ -14,6 +14,9 @@ from simple_knn._C import distCUDA2
 import utils.general_utils as utils
 
 
+CUDA_MULTINOMIAL_MAX_CATEGORIES = 1 << 24
+
+
 def _counts(local_count):
     group = utils.DEFAULT_GROUP
     count = torch.tensor([local_count], dtype=torch.long, device="cuda")
@@ -329,6 +332,26 @@ def _collect_importance(
     return importance, overload_pressure, overloaded_touches, tile_summary
 
 
+def _weighted_sample_without_replacement(weights, sample_count, generator):
+    """Sample weighted indices without CUDA multinomial's category limit."""
+    if sample_count == weights.numel():
+        return torch.arange(weights.numel(), device=weights.device)
+    if weights.numel() <= CUDA_MULTINOMIAL_MAX_CATEGORIES:
+        return torch.multinomial(
+            weights,
+            sample_count,
+            replacement=False,
+            generator=generator,
+        )
+
+    # Exponential keys induce weighted sampling without replacement while
+    # avoiding CUDA multinomial's 2^24 category limit.
+    keys = torch.empty_like(weights)
+    keys.exponential_(generator=generator)
+    keys.div_(weights)
+    return torch.topk(keys, sample_count, largest=False, sorted=False).indices
+
+
 def _source_sampling_mask(local_importance, sampling_factor, seed):
     counts = _counts(local_importance.numel())
     global_importance = _gather_to_rank0(local_importance, counts)
@@ -340,17 +363,18 @@ def _source_sampling_mask(local_importance, sampling_factor, seed):
     sampled_count = 0
     nonzero_count = 0
     if utils.DEFAULT_GROUP.rank() == 0:
-        nonzero_count = int((global_importance != 0).sum().item())
+        positive_ids = torch.nonzero(global_importance > 0, as_tuple=False).flatten()
+        nonzero_count = int(positive_ids.numel())
         sampled_count = int(nonzero_count * sampling_factor)
         if sampled_count > 0:
             generator = torch.Generator(device="cuda")
             generator.manual_seed(seed)
-            indices = torch.multinomial(
-                global_importance,
+            sampled_ids = _weighted_sample_without_replacement(
+                global_importance[positive_ids],
                 sampled_count,
-                replacement=False,
                 generator=generator,
             )
+            indices = positive_ids[sampled_ids]
             global_mask = torch.zeros_like(global_importance, dtype=torch.uint8)
             global_mask[indices] = 1
 
