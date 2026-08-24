@@ -263,15 +263,19 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	return geom;
 }
 
-CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
+CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N, bool fused)
 {
 	ImageState img;
 	obtain(chunk, img.accum_alpha, N, 128);
 	obtain(chunk, img.n_contrib, N, 128);
-	obtain(chunk, img.n_contrib2loss, N, 128);
+	img.n_contrib2loss = nullptr;
+	if (!fused)
+		obtain(chunk, img.n_contrib2loss, N, 128);
 	obtain(chunk, img.ranges, N, 128);
 	obtain(chunk, img.max_contrib, N, 128);
-	obtain(chunk, img.pixel_colors, N * NUM_CHANNELS, 128);
+	img.pixel_colors = nullptr;
+	if (!fused)
+		obtain(chunk, img.pixel_colors, N * NUM_CHANNELS, 128);
 	obtain(chunk, img.bucket_count, N, 128);
 	obtain(chunk, img.bucket_offsets, N, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, img.bucket_count_scan_size, img.bucket_count, img.bucket_count, N);
@@ -279,10 +283,12 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	return img;
 }
 
-CudaRasterizer::SampleState CudaRasterizer::SampleState::fromChunk(char*& chunk, size_t B)
+CudaRasterizer::SampleState CudaRasterizer::SampleState::fromChunk(char*& chunk, size_t B, bool fused)
 {
 	SampleState sample;
-	obtain(chunk, sample.bucket_to_tile, B, 128);
+	sample.bucket_to_tile = nullptr;
+	if (!fused)
+		obtain(chunk, sample.bucket_to_tile, B, 128);
 	obtain(chunk, sample.T, B * BLOCK_X * BLOCK_Y, 128);
 	obtain(chunk, sample.ar, NUM_CHANNELS * B * BLOCK_X * BLOCK_Y, 128);
 	return sample;
@@ -544,13 +550,6 @@ int CudaRasterizer::Rasterizer::preprocessForward(
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 	int tile_num = tile_grid.x * tile_grid.y;
 
-	// allocate temporary buffer for tiles_touched.
-	// In sep_rendering==True case, we will compute tiles_touched in the renderForward. 
-	// TODO: remove it later by modifying FORWARD::preprocess when we deprecate sep_rendering==False case
-	uint32_t* tiles_touched_temp_buffer;
-	// CHECK_CUDA(cudaMalloc(&tiles_touched_temp_buffer, P * sizeof(uint32_t)), debug);
-	// CHECK_CUDA(cudaMemset(tiles_touched_temp_buffer, 0, P * sizeof(uint32_t)), debug);
-
 	timer.start("10 preprocess");
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	CHECK_CUDA(FORWARD::preprocess(
@@ -576,7 +575,7 @@ int CudaRasterizer::Rasterizer::preprocessForward(
 		rgb,
 		conic_opacity,
 		tile_grid,
-		tiles_touched_temp_buffer,
+		nullptr,
 		prefiltered
 	), debug)
 	timer.stop("10 preprocess");
@@ -588,8 +587,6 @@ int CudaRasterizer::Rasterizer::preprocessForward(
 		timer.printAllTimes(iteration, world_size, global_rank, log_folder, true);
 	}
 	delete log_tmp;
-	// free temporary buffer for tiles_touched. TODO: remove it. 
-	// CHECK_CUDA(cudaFree(tiles_touched_temp_buffer), debug);
 	return num_rendered;
 }
 
@@ -1009,6 +1006,11 @@ int CudaRasterizer::Rasterizer::renderForward(
 	return num_rendered;
 }
 
+namespace CudaRasterizer
+{
+namespace
+{
+
 static int renderForwardL1Impl(
 	std::function<char* (size_t)> geometryBuffer,
 	std::function<char* (size_t)> binningBuffer,
@@ -1056,9 +1058,20 @@ static int renderForwardL1Impl(
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 	const int tile_num = tile_grid.x * tile_grid.y;
 
-	size_t img_chunk_size = required<ImageState>(width * height);
+	size_t img_chunk_size;
+	if (fuse_per_gaussian_backward)
+	{
+		char* size = nullptr;
+		ImageState::fromChunk(size, width * height, true);
+		img_chunk_size = reinterpret_cast<size_t>(size) + 128;
+	}
+	else
+	{
+		img_chunk_size = required<ImageState>(width * height);
+	}
 	char* img_chunkptr = imageBuffer(img_chunk_size);
-	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+	ImageState imgState = ImageState::fromChunk(
+		img_chunkptr, width * height, fuse_per_gaussian_backward);
 
 	timer.start("24 updateDistributedStatLocally.updateTileTouched");
 	updateTileTouched <<<(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
@@ -1132,9 +1145,20 @@ static int renderForwardL1Impl(
 		CHECK_CUDA(cudaMemcpy(&bucket_sum, imgState.bucket_offsets + tile_num - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 	*n_bucket = bucket_sum;
 
-	size_t sample_chunk_size = required<SampleState>(bucket_sum);
+	size_t sample_chunk_size;
+	if (fuse_per_gaussian_backward)
+	{
+		char* size = nullptr;
+		SampleState::fromChunk(size, bucket_sum, true);
+		sample_chunk_size = reinterpret_cast<size_t>(size) + 128;
+	}
+	else
+	{
+		sample_chunk_size = required<SampleState>(bucket_sum);
+	}
 	char* sample_chunkptr = sampleBuffer(sample_chunk_size);
-	SampleState sampleState = SampleState::fromChunk(sample_chunkptr, bucket_sum);
+	SampleState sampleState = SampleState::fromChunk(
+		sample_chunkptr, bucket_sum, fuse_per_gaussian_backward);
 
 	CHECK_CUDA(cudaMemset(out_loss, 0, sizeof(float)), debug);
 
@@ -1144,12 +1168,12 @@ static int renderForwardL1Impl(
 	{
 		CHECK_CUDA(FORWARD::render_l1_fused_per_gaussian(
 			tile_grid, block, imgState.ranges, binningState.point_list,
-			imgState.bucket_offsets, sampleState.bucket_to_tile,
-			sampleState.T, sampleState.ar, width, height, means2D, feature_ptr,
+			imgState.bucket_offsets, sampleState.T, sampleState.ar,
+			width, height, means2D, feature_ptr,
 			conic_opacity, imgState.accum_alpha, imgState.n_contrib,
-			imgState.max_contrib, imgState.n_contrib2loss, background, gt_image,
+			imgState.max_contrib, background, gt_image,
 			gt_image_y_offset, gt_image_height, loss_compute_locally, lambda_l1,
-			lambda_ssim, out_loss, out_color, dL_dmean2D,
+			lambda_ssim, out_loss, dL_dmean2D,
 			dL_dconic_opacity, dL_dcolors, max_contribution_area), debug)
 	}
 	else
@@ -1169,29 +1193,32 @@ static int renderForwardL1Impl(
 	}
 	timer.stop("70 render_l1");
 
-	timer.start("81 sum_n_render");
-	get_n_render<<< (tile_num + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
-		tile_num,
-		imgState.ranges,
-		n_render
-	);
-	timer.stop("81 sum_n_render");
-	timer.start("82 sum_n_consider");
-	reduce_data_per_block<< <tile_grid, block >> > (
-		width, height,
-		imgState.n_contrib,
-		n_consider,
-		render_compute_locally
-	);
-	timer.stop("82 sum_n_consider");
-	timer.start("83 sum_n_contrib");
-	reduce_data_per_block<< <tile_grid, block >> > (
-		width, height,
-		imgState.n_contrib2loss,
-		n_contrib,
-		render_compute_locally
-	);
-	timer.stop("83 sum_n_contrib");
+	if (!fuse_per_gaussian_backward)
+	{
+		timer.start("81 sum_n_render");
+		get_n_render<<< (tile_num + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
+			tile_num,
+			imgState.ranges,
+			n_render
+		);
+		timer.stop("81 sum_n_render");
+		timer.start("82 sum_n_consider");
+		reduce_data_per_block<< <tile_grid, block >> > (
+			width, height,
+			imgState.n_contrib,
+			n_consider,
+			render_compute_locally
+		);
+		timer.stop("82 sum_n_consider");
+		timer.start("83 sum_n_contrib");
+		reduce_data_per_block<< <tile_grid, block >> > (
+			width, height,
+			imgState.n_contrib2loss,
+			n_contrib,
+			render_compute_locally
+		);
+		timer.stop("83 sum_n_contrib");
+	}
 
 	float forward_render_time = timer.elapsedMilliseconds("70 render_l1", "sum") + timer.elapsedMilliseconds("50 SortPairs", "sum") + timer.elapsedMilliseconds("40 duplicateWithKeys", "sum");
 	args["stats_collector"]["forward_render_time"] = forward_render_time;
@@ -1205,6 +1232,9 @@ static int renderForwardL1Impl(
 
 	return num_rendered;
 }
+
+} // namespace
+} // namespace CudaRasterizer
 
 int CudaRasterizer::Rasterizer::renderForwardL1(
 	std::function<char* (size_t)> geometryBuffer,
@@ -1238,9 +1268,8 @@ int CudaRasterizer::Rasterizer::renderForwardL1FusedPerGaussian(
 	float2* means2D, float* depths, int* radii, float4* conic_opacity,
 	float* rgb, bool* render_compute_locally, bool* loss_compute_locally,
 	const float* gt_image, int gt_image_y_offset, int gt_image_height,
-	float lambda_l1, float lambda_ssim, float* out_loss, float* out_color,
+	float lambda_l1, float lambda_ssim, float* out_loss,
 	float2* dL_dmean2D, float4* dL_dconic_opacity, float* dL_dcolors,
-	int* n_render, int* n_consider, int* n_contrib,
 	float* max_contribution_area, int* n_bucket, bool debug,
 	const pybind11::dict &args)
 {
@@ -1249,8 +1278,8 @@ int CudaRasterizer::Rasterizer::renderForwardL1FusedPerGaussian(
 		width, height, means2D, depths, radii, conic_opacity, rgb,
 		render_compute_locally, loss_compute_locally, gt_image,
 		gt_image_y_offset, gt_image_height, lambda_l1, lambda_ssim, out_loss,
-		out_color, nullptr, dL_dmean2D, dL_dconic_opacity, dL_dcolors,
-		n_render, n_consider, n_contrib, max_contribution_area, n_bucket, true,
+		nullptr, nullptr, dL_dmean2D, dL_dconic_opacity, dL_dcolors,
+		nullptr, nullptr, nullptr, max_contribution_area, n_bucket, true,
 		debug, args);
 }
 

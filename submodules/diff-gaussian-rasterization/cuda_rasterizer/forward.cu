@@ -976,7 +976,6 @@ renderL1FusedPerGaussianCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	const uint32_t* __restrict__ per_tile_bucket_offset,
-	uint32_t* __restrict__ bucket_to_tile,
 	float* __restrict__ sampled_T,
 	float* __restrict__ sampled_ar,
 	int W, int H,
@@ -986,7 +985,6 @@ renderL1FusedPerGaussianCUDA(
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	uint32_t* __restrict__ max_contrib,
-	uint32_t* __restrict__ n_contrib2loss,
 	const float* __restrict__ bg_color,
 	const float* __restrict__ gt_image,
 	int gt_image_y_offset,
@@ -995,12 +993,12 @@ renderL1FusedPerGaussianCUDA(
 	float lambda_l1,
 	float lambda_ssim,
 	float* __restrict__ out_loss,
-	float* __restrict__ out_color,
 	float2* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic_opacity,
 	float* __restrict__ dL_dcolors,
 	float* __restrict__ max_contribution_area)
 {
+	static_assert(CHANNELS <= 5, "SSIM storage must cover all color channels");
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 
@@ -1025,22 +1023,21 @@ renderL1FusedPerGaussianCUDA(
 
 	uint32_t bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
 	int num_buckets = (toDo + 31) / 32;
-	(void)bucket_to_tile;
 
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_features[CHANNELS * BLOCK_SIZE];
-	__shared__ float s_x[BLOCK_SIZE];
-	__shared__ float s_y[BLOCK_SIZE];
-	__shared__ float s_x2[BLOCK_SIZE];
-	__shared__ float s_y2[BLOCK_SIZE];
-	__shared__ float s_xy[BLOCK_SIZE];
+	__shared__ float ssim_storage[5 * BLOCK_SIZE];
+	float* s_x = ssim_storage;
+	float* s_y = ssim_storage + BLOCK_SIZE;
+	float* s_x2 = ssim_storage + 2 * BLOCK_SIZE;
+	float* s_y2 = ssim_storage + 3 * BLOCK_SIZE;
+	float* s_xy = ssim_storage + 4 * BLOCK_SIZE;
 
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
-	uint32_t thread_n_contrib2loss = 0;
 	float C[CHANNELS] = { 0 };
 	float max_weight = 0.0f;
 	int max_weight_id = -1;
@@ -1093,7 +1090,6 @@ renderL1FusedPerGaussianCUDA(
 				continue;
 			}
 
-			thread_n_contrib2loss++;
 			const float weight = alpha * T;
 			if (COLLECT_BLUR_STATS && weight > max_weight)
 			{
@@ -1118,12 +1114,9 @@ renderL1FusedPerGaussianCUDA(
 	{
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
-		n_contrib2loss[pix_id] = thread_n_contrib2loss;
 		for (int ch = 0; ch < CHANNELS; ch++)
 		{
-			const uint32_t idx = ch * H * W + pix_id;
 			const float rendered = C[ch] + T * bg_color[ch];
-			out_color[idx] = rendered;
 			if (compute_loss)
 			{
 				const int gt_y = (int)pix.y - gt_image_y_offset;
@@ -1231,10 +1224,13 @@ renderL1FusedPerGaussianCUDA(
 	}
 
 	// The forward Gaussian cache is dead at this point. Reuse its storage for
-	// per-pixel loss gradients consumed by the per-Gaussian phase below.
+	// per-pixel colors and loss gradients consumed by the phase below.
 	block.sync();
 	for (int ch = 0; ch < CHANNELS; ++ch)
+	{
+		ssim_storage[ch * BLOCK_SIZE + block.thread_rank()] = inside ? C[ch] : 0.0f;
 		collected_features[ch * BLOCK_SIZE + block.thread_rank()] = pixel_dL[ch];
+	}
 	block.sync();
 
 	if (!compute_loss || num_buckets == 0)
@@ -1315,7 +1311,7 @@ renderL1FusedPerGaussianCUDA(
 				for (int ch = 0; ch < CHANNELS; ++ch)
 				{
 					accumulated_remainder[ch] =
-						-(out_color[ch * H * W + backward_pix_id] - final_pixel_T * bg_color[ch])
+						-ssim_storage[ch * BLOCK_SIZE + pixel_in_tile]
 						+ sampled_ar[global_bucket_idx * BLOCK_SIZE * CHANNELS
 							+ ch * BLOCK_SIZE + pixel_in_tile];
 					pixel_loss_grad[ch] = collected_features[ch * BLOCK_SIZE + pixel_in_tile];
@@ -1427,7 +1423,6 @@ void FORWARD::render_l1_fused_per_gaussian(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	const uint32_t* per_tile_bucket_offset,
-	uint32_t* bucket_to_tile,
 	float* sampled_T,
 	float* sampled_ar,
 	int W, int H,
@@ -1437,7 +1432,6 @@ void FORWARD::render_l1_fused_per_gaussian(
 	float* final_T,
 	uint32_t* n_contrib,
 	uint32_t* max_contrib,
-	uint32_t* n_contrib2loss,
 	const float* bg_color,
 	const float* gt_image,
 	int gt_image_y_offset,
@@ -1446,7 +1440,6 @@ void FORWARD::render_l1_fused_per_gaussian(
 	float lambda_l1,
 	float lambda_ssim,
 	float* out_loss,
-	float* out_color,
 	float2* dL_dmean2D,
 	float4* dL_dconic_opacity,
 	float* dL_dcolors,
@@ -1457,7 +1450,6 @@ void FORWARD::render_l1_fused_per_gaussian(
 			ranges,
 			point_list,
 			per_tile_bucket_offset,
-			bucket_to_tile,
 			sampled_T,
 			sampled_ar,
 			W, H,
@@ -1467,7 +1459,6 @@ void FORWARD::render_l1_fused_per_gaussian(
 			final_T,
 			n_contrib,
 			max_contrib,
-			n_contrib2loss,
 			bg_color,
 			gt_image,
 			gt_image_y_offset,
@@ -1476,7 +1467,6 @@ void FORWARD::render_l1_fused_per_gaussian(
 			lambda_l1,
 			lambda_ssim,
 			out_loss,
-			out_color,
 			dL_dmean2D,
 			dL_dconic_opacity,
 			dL_dcolors,
@@ -1486,7 +1476,6 @@ void FORWARD::render_l1_fused_per_gaussian(
 			ranges,
 			point_list,
 			per_tile_bucket_offset,
-			bucket_to_tile,
 			sampled_T,
 			sampled_ar,
 			W, H,
@@ -1496,7 +1485,6 @@ void FORWARD::render_l1_fused_per_gaussian(
 			final_T,
 			n_contrib,
 			max_contrib,
-			n_contrib2loss,
 			bg_color,
 			gt_image,
 			gt_image_y_offset,
@@ -1505,7 +1493,6 @@ void FORWARD::render_l1_fused_per_gaussian(
 			lambda_l1,
 			lambda_ssim,
 			out_loss,
-			out_color,
 			dL_dmean2D,
 			dL_dconic_opacity,
 			dL_dcolors,

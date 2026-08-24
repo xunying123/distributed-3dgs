@@ -56,7 +56,7 @@ namespace CudaRasterizer
 		uint32_t* max_contrib;
 		float* pixel_colors;
 
-		static ImageState fromChunk(char*& chunk, size_t N);
+		static ImageState fromChunk(char*& chunk, size_t N, bool fused=false);
 	};
 
 	struct SampleState
@@ -65,7 +65,7 @@ namespace CudaRasterizer
 		float* T;
 		float* ar;
 
-		static SampleState fromChunk(char*& chunk, size_t B);
+		static SampleState fromChunk(char*& chunk, size_t B, bool fused=false);
 	};
 
 	struct BinningState

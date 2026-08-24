@@ -641,17 +641,14 @@ RenderGaussiansL1FusedPerGaussianCUDA(
   auto float_opts = means2D.options().dtype(torch::kFloat32);
 
   torch::Tensor out_loss = torch::zeros({}, float_opts);
-  torch::Tensor out_color = torch::empty({NUM_CHANNELS, H, W}, float_opts);
+  torch::Tensor out_color = torch::empty({0}, float_opts);
   torch::Tensor dL_dmeans2D = torch::zeros({P, 2}, float_opts);
   torch::Tensor dL_dconic_opacity = torch::zeros({P, 4}, float_opts);
   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, float_opts);
 
-  const int TILE_Y = (H + BLOCK_Y - 1) / BLOCK_Y;
-  const int TILE_X = (W + BLOCK_X - 1) / BLOCK_X;
-  const int tile_num = TILE_Y * TILE_X;
-  torch::Tensor n_render = torch::full({tile_num}, 0, int_opts);
-  torch::Tensor n_consider = torch::full({tile_num}, 0, int_opts);
-  torch::Tensor n_contrib = torch::full({tile_num}, 0, int_opts);
+  torch::Tensor n_render = torch::empty({0}, int_opts);
+  torch::Tensor n_consider = torch::empty({0}, int_opts);
+  torch::Tensor n_contrib = torch::empty({0}, int_opts);
   const bool collect_blur_stats = args.contains("collect_blur_stats") &&
     pybind11::cast<bool>(args["collect_blur_stats"]);
   torch::Tensor max_contribution_area = torch::zeros(
@@ -693,13 +690,9 @@ RenderGaussiansL1FusedPerGaussianCUDA(
 		lambda_l1,
 		lambda_ssim,
 		out_loss.contiguous().data<float>(),
-		out_color.contiguous().data<float>(),
 		reinterpret_cast<float2*>(dL_dmeans2D.contiguous().data<float>()),
 		reinterpret_cast<float4*>(dL_dconic_opacity.contiguous().data<float>()),
 		dL_dcolors.contiguous().data<float>(),
-		n_render.contiguous().data<int>(),
-		n_consider.contiguous().data<int>(),
-		n_contrib.contiguous().data<int>(),
 		collect_blur_stats ? max_contribution_area.contiguous().data<float>() : nullptr,
 		&n_bucket,
 		debug,
