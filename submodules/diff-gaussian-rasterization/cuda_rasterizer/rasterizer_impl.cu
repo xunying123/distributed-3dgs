@@ -1009,7 +1009,7 @@ int CudaRasterizer::Rasterizer::renderForward(
 	return num_rendered;
 }
 
-int CudaRasterizer::Rasterizer::renderForwardL1(
+static int renderForwardL1Impl(
 	std::function<char* (size_t)> geometryBuffer,
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
@@ -1032,11 +1032,15 @@ int CudaRasterizer::Rasterizer::renderForwardL1(
 	float* out_loss,
 	float* out_color,
 	float* dL_dpixels,
+	float2* dL_dmean2D,
+	float4* dL_dconic_opacity,
+	float* dL_dcolors,
 	int* n_render,
 	int* n_consider,
 	int* n_contrib,
 	float* max_contribution_area,
 	int* n_bucket,
+	bool fuse_per_gaussian_backward,
 	bool debug,
 	const pybind11::dict &args)
 {
@@ -1136,35 +1140,34 @@ int CudaRasterizer::Rasterizer::renderForwardL1(
 
 	const float* feature_ptr = rgb;
 	timer.start("70 render_l1");
-	CHECK_CUDA(FORWARD::render_l1(
-		tile_grid, block,
-		imgState.ranges,
-		binningState.point_list,
-		imgState.bucket_offsets,
-		sampleState.bucket_to_tile,
-		sampleState.T,
-		sampleState.ar,
-		width, height,
-		means2D,
-		feature_ptr,
-		conic_opacity,
-		imgState.accum_alpha,
-		imgState.n_contrib,
-		imgState.max_contrib,
-		imgState.n_contrib2loss,
-		background,
-		gt_image,
-		gt_image_y_offset,
-		gt_image_height,
-		loss_compute_locally,
-		lambda_l1,
-		lambda_ssim,
-		out_loss,
-		out_color,
-		dL_dpixels,
-		max_contribution_area), debug)
+	if (fuse_per_gaussian_backward)
+	{
+		CHECK_CUDA(FORWARD::render_l1_fused_per_gaussian(
+			tile_grid, block, imgState.ranges, binningState.point_list,
+			imgState.bucket_offsets, sampleState.bucket_to_tile,
+			sampleState.T, sampleState.ar, width, height, means2D, feature_ptr,
+			conic_opacity, imgState.accum_alpha, imgState.n_contrib,
+			imgState.max_contrib, imgState.n_contrib2loss, background, gt_image,
+			gt_image_y_offset, gt_image_height, loss_compute_locally, lambda_l1,
+			lambda_ssim, out_loss, out_color, dL_dmean2D,
+			dL_dconic_opacity, dL_dcolors, max_contribution_area), debug)
+	}
+	else
+	{
+		CHECK_CUDA(FORWARD::render_l1(
+			tile_grid, block, imgState.ranges, binningState.point_list,
+			imgState.bucket_offsets, sampleState.bucket_to_tile,
+			sampleState.T, sampleState.ar, width, height, means2D, feature_ptr,
+			conic_opacity, imgState.accum_alpha, imgState.n_contrib,
+			imgState.max_contrib, imgState.n_contrib2loss, background, gt_image,
+			gt_image_y_offset, gt_image_height, loss_compute_locally, lambda_l1,
+			lambda_ssim, out_loss, out_color, dL_dpixels,
+			max_contribution_area), debug)
+		CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color,
+			sizeof(float) * width * height * NUM_CHANNELS,
+			cudaMemcpyDeviceToDevice), debug)
+	}
 	timer.stop("70 render_l1");
-	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHANNELS, cudaMemcpyDeviceToDevice), debug);
 
 	timer.start("81 sum_n_render");
 	get_n_render<<< (tile_num + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >>> (
@@ -1193,12 +1196,62 @@ int CudaRasterizer::Rasterizer::renderForwardL1(
 	float forward_render_time = timer.elapsedMilliseconds("70 render_l1", "sum") + timer.elapsedMilliseconds("50 SortPairs", "sum") + timer.elapsedMilliseconds("40 duplicateWithKeys", "sum");
 	args["stats_collector"]["forward_render_time"] = forward_render_time;
 	args["stats_collector"]["forward_loss_time"] = 0.0f;
+	if (fuse_per_gaussian_backward)
+		args["stats_collector"]["backward_render_time"] = 0.0f;
 
 	if (mode == "train" && zhx_time && iteration % log_interval == 1) {
 		timer.printAllTimes(iteration, world_size, global_rank, log_folder, false);
 	}
 
 	return num_rendered;
+}
+
+int CudaRasterizer::Rasterizer::renderForwardL1(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	std::function<char* (size_t)> sampleBuffer,
+	const int P, const float* background, const int width, int height,
+	float2* means2D, float* depths, int* radii, float4* conic_opacity,
+	float* rgb, bool* render_compute_locally, bool* loss_compute_locally,
+	const float* gt_image, int gt_image_y_offset, int gt_image_height,
+	float lambda_l1, float lambda_ssim, float* out_loss, float* out_color,
+	float* dL_dpixels, int* n_render, int* n_consider, int* n_contrib,
+	float* max_contribution_area, int* n_bucket, bool debug,
+	const pybind11::dict &args)
+{
+	return renderForwardL1Impl(
+		geometryBuffer, binningBuffer, imageBuffer, sampleBuffer, P, background,
+		width, height, means2D, depths, radii, conic_opacity, rgb,
+		render_compute_locally, loss_compute_locally, gt_image,
+		gt_image_y_offset, gt_image_height, lambda_l1, lambda_ssim, out_loss,
+		out_color, dL_dpixels, nullptr, nullptr, nullptr, n_render, n_consider,
+		n_contrib, max_contribution_area, n_bucket, false, debug, args);
+}
+
+int CudaRasterizer::Rasterizer::renderForwardL1FusedPerGaussian(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	std::function<char* (size_t)> sampleBuffer,
+	const int P, const float* background, const int width, int height,
+	float2* means2D, float* depths, int* radii, float4* conic_opacity,
+	float* rgb, bool* render_compute_locally, bool* loss_compute_locally,
+	const float* gt_image, int gt_image_y_offset, int gt_image_height,
+	float lambda_l1, float lambda_ssim, float* out_loss, float* out_color,
+	float2* dL_dmean2D, float4* dL_dconic_opacity, float* dL_dcolors,
+	int* n_render, int* n_consider, int* n_contrib,
+	float* max_contribution_area, int* n_bucket, bool debug,
+	const pybind11::dict &args)
+{
+	return renderForwardL1Impl(
+		geometryBuffer, binningBuffer, imageBuffer, sampleBuffer, P, background,
+		width, height, means2D, depths, radii, conic_opacity, rgb,
+		render_compute_locally, loss_compute_locally, gt_image,
+		gt_image_y_offset, gt_image_height, lambda_l1, lambda_ssim, out_loss,
+		out_color, nullptr, dL_dmean2D, dL_dconic_opacity, dL_dcolors,
+		n_render, n_consider, n_contrib, max_contribution_area, n_bucket, true,
+		debug, args);
 }
 
 // Produce necessary gradients for optimization, corresponding

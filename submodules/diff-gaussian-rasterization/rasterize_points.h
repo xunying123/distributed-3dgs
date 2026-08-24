@@ -200,6 +200,25 @@ RenderGaussiansL1CUDA(
 		const bool debug,
 		const pybind11::dict &args);
 
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RenderGaussiansL1FusedPerGaussianCUDA(
+		const torch::Tensor& background,
+	    const int image_height,
+	    const int image_width,
+		torch::Tensor& means2D,
+		torch::Tensor& depths,
+		torch::Tensor& radii,
+		torch::Tensor& conic_opacity,
+		torch::Tensor& rgb,
+		const torch::Tensor& render_compute_locally,
+		const torch::Tensor& loss_compute_locally,
+		const torch::Tensor& gt_image,
+		const int gt_image_y_offset,
+		const float lambda_l1,
+		const float lambda_ssim,
+		const bool debug,
+		const pybind11::dict &args);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 RenderGaussiansBackwardCUDA(
 	const torch::Tensor& background,

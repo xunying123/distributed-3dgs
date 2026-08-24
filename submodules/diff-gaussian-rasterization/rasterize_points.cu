@@ -556,6 +556,82 @@ RenderGaussiansL1CUDA(
 	const bool debug,
 	const pybind11::dict &args)
 {
+	const int P = means2D.size(0);
+	const int H = image_height;
+	const int W = image_width;
+	const int gt_image_height = gt_image.size(1);
+	auto int_opts = means2D.options().dtype(torch::kInt32);
+	auto float_opts = means2D.options().dtype(torch::kFloat32);
+
+	torch::Tensor out_loss = torch::zeros({}, float_opts);
+	torch::Tensor out_color = torch::empty({NUM_CHANNELS, H, W}, float_opts);
+	torch::Tensor dL_dpixels = torch::empty({NUM_CHANNELS, H, W}, float_opts);
+	const int tile_num = ((H + BLOCK_Y - 1) / BLOCK_Y) * ((W + BLOCK_X - 1) / BLOCK_X);
+	torch::Tensor n_render = torch::full({tile_num}, 0, int_opts);
+	torch::Tensor n_consider = torch::full({tile_num}, 0, int_opts);
+	torch::Tensor n_contrib = torch::full({tile_num}, 0, int_opts);
+	const bool collect_blur_stats = args.contains("collect_blur_stats") &&
+		pybind11::cast<bool>(args["collect_blur_stats"]);
+	torch::Tensor max_contribution_area = torch::zeros(
+		{collect_blur_stats ? P : 0}, float_opts);
+
+	torch::Device device(torch::kCUDA);
+	torch::TensorOptions options(torch::kByte);
+	torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
+	torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
+	torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+	torch::Tensor sampleBuffer = torch::empty({0}, options.device(device));
+	std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
+	std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
+	std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+	std::function<char*(size_t)> sampleFunc = resizeFunctional(sampleBuffer);
+
+	int rendered = 0;
+	int n_bucket = 0;
+	if (P != 0)
+	{
+		rendered = CudaRasterizer::Rasterizer::renderForwardL1(
+			geomFunc, binningFunc, imgFunc, sampleFunc, P,
+			background.contiguous().data<float>(), W, H,
+			reinterpret_cast<float2*>(means2D.contiguous().data<float>()),
+			depths.contiguous().data<float>(), radii.contiguous().data<int>(),
+			reinterpret_cast<float4*>(conic_opacity.contiguous().data<float>()),
+			rgb.contiguous().data<float>(),
+			render_compute_locally.contiguous().data<bool>(),
+			loss_compute_locally.contiguous().data<bool>(),
+			gt_image.contiguous().data<float>(), gt_image_y_offset,
+			gt_image_height, lambda_l1, lambda_ssim,
+			out_loss.contiguous().data<float>(), out_color.contiguous().data<float>(),
+			dL_dpixels.contiguous().data<float>(), n_render.contiguous().data<int>(),
+			n_consider.contiguous().data<int>(), n_contrib.contiguous().data<int>(),
+			collect_blur_stats ? max_contribution_area.contiguous().data<float>() : nullptr,
+			&n_bucket, debug, args);
+	}
+	return std::make_tuple(
+		rendered, n_bucket, out_loss, out_color, dL_dpixels, n_render,
+		n_consider, n_contrib, max_contribution_area, geomBuffer, binningBuffer,
+		imgBuffer, sampleBuffer);
+}
+
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RenderGaussiansL1FusedPerGaussianCUDA(
+	const torch::Tensor& background,
+	const int image_height,
+	const int image_width,
+	torch::Tensor& means2D,
+	torch::Tensor& depths,
+	torch::Tensor& radii,
+	torch::Tensor& conic_opacity,
+	torch::Tensor& rgb,
+	const torch::Tensor& render_compute_locally,
+	const torch::Tensor& loss_compute_locally,
+	const torch::Tensor& gt_image,
+	const int gt_image_y_offset,
+	const float lambda_l1,
+	const float lambda_ssim,
+	const bool debug,
+	const pybind11::dict &args)
+{
   const int P = means2D.size(0);
   const int H = image_height;
   const int W = image_width;
@@ -566,7 +642,9 @@ RenderGaussiansL1CUDA(
 
   torch::Tensor out_loss = torch::zeros({}, float_opts);
   torch::Tensor out_color = torch::empty({NUM_CHANNELS, H, W}, float_opts);
-  torch::Tensor dL_dpixels = torch::empty({NUM_CHANNELS, H, W}, float_opts);
+  torch::Tensor dL_dmeans2D = torch::zeros({P, 2}, float_opts);
+  torch::Tensor dL_dconic_opacity = torch::zeros({P, 4}, float_opts);
+  torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, float_opts);
 
   const int TILE_Y = (H + BLOCK_Y - 1) / BLOCK_Y;
   const int TILE_X = (W + BLOCK_X - 1) / BLOCK_X;
@@ -594,7 +672,7 @@ RenderGaussiansL1CUDA(
   int n_bucket = 0;
   if(P != 0)
   {
-	  rendered = CudaRasterizer::Rasterizer::renderForwardL1(
+	  rendered = CudaRasterizer::Rasterizer::renderForwardL1FusedPerGaussian(
 		geomFunc,
 		binningFunc,
 		imgFunc,
@@ -616,7 +694,9 @@ RenderGaussiansL1CUDA(
 		lambda_ssim,
 		out_loss.contiguous().data<float>(),
 		out_color.contiguous().data<float>(),
-		dL_dpixels.contiguous().data<float>(),
+		reinterpret_cast<float2*>(dL_dmeans2D.contiguous().data<float>()),
+		reinterpret_cast<float4*>(dL_dconic_opacity.contiguous().data<float>()),
+		dL_dcolors.contiguous().data<float>(),
 		n_render.contiguous().data<int>(),
 		n_consider.contiguous().data<int>(),
 		n_contrib.contiguous().data<int>(),
@@ -626,9 +706,9 @@ RenderGaussiansL1CUDA(
 		args);
   }
   return std::make_tuple(
-    rendered, n_bucket, out_loss, out_color, dL_dpixels, n_render, n_consider,
-    n_contrib, max_contribution_area, geomBuffer, binningBuffer, imgBuffer,
-    sampleBuffer);
+    rendered, n_bucket, out_loss, out_color, dL_dmeans2D,
+    dL_dconic_opacity, dL_dcolors, n_render, n_consider, n_contrib,
+    max_contribution_area);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>

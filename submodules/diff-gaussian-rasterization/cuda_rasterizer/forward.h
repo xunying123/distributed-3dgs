@@ -132,6 +132,36 @@ namespace FORWARD
 		float* out_color,
 		float* dL_dpixels,
 		float* max_contribution_area);
+
+	void render_l1_fused_per_gaussian(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		const uint32_t* per_tile_bucket_offset,
+		uint32_t* bucket_to_tile,
+		float* sampled_T,
+		float* sampled_ar,
+		int W, int H,
+		const float2* points_xy_image,
+		const float* features,
+		const float4* conic_opacity,
+		float* final_T,
+		uint32_t* n_contrib,
+		uint32_t* max_contrib,
+		uint32_t* n_contrib2loss,
+		const float* bg_color,
+		const float* gt_image,
+		int gt_image_y_offset,
+		int gt_image_height,
+		const bool* loss_compute_locally,
+		float lambda_l1,
+		float lambda_ssim,
+		float* out_loss,
+		float* out_color,
+		float2* dL_dmean2D,
+		float4* dL_dconic_opacity,
+		float* dL_dcolors,
+		float* max_contribution_area);
 }
 
 

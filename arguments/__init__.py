@@ -75,7 +75,7 @@ class AuxiliaryParams(ParamGroup):
         self.log_interval = 250
         self.llffhold = 8
         self.backend = "default" # "default", "gsplat"
-        self.backward_backend = "per_gaussian"  # "per_gaussian", "per_pixel"
+        self.backward_backend = "per_gaussian"  # "per_gaussian", "per_pixel", "fused_per_gaussian"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -295,9 +295,14 @@ def find_latest_checkpoint(log_folder):
 def init_args(args):
 
     args.backward_backend = args.backward_backend.strip().lower()
-    if args.backward_backend not in ("per_gaussian", "per_pixel"):
+    if args.backward_backend not in (
+        "per_gaussian",
+        "per_pixel",
+        "fused_per_gaussian",
+    ):
         raise ValueError(
-            "--backward_backend must be either 'per_gaussian' or 'per_pixel'"
+            "--backward_backend must be 'per_gaussian', 'per_pixel', or "
+            "'fused_per_gaussian'"
         )
 
     args.mini_splatting_imp_metric = args.mini_splatting_imp_metric.strip().lower()

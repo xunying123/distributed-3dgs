@@ -22,6 +22,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("render_gaussians_importance", &RenderGaussiansImportanceCUDA);
   m.def("render_gaussians_depth", &RenderGaussiansDepthCUDA);
   m.def("render_gaussians_l1", &RenderGaussiansL1CUDA);
+  m.def("render_gaussians_l1_fused_per_gaussian", &RenderGaussiansL1FusedPerGaussianCUDA);
   m.def("render_gaussians_backward", &RenderGaussiansBackwardCUDA);
   m.def("render_gaussians_backward_per_gaussian", &RenderGaussiansBackwardPerGaussianCUDA);
   m.def("get_local2j_ids_bool", &GetLocal2jIdsBoolCUDA);

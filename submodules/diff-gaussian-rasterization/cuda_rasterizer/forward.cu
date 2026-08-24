@@ -750,6 +750,258 @@ renderL1CUDA(
 	float* __restrict__ max_contribution_area)
 {
 	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
+	const bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
+	const int tile_w = min((int)BLOCK_X, W - (int)pix_min.x);
+	const int tile_h = min((int)BLOCK_Y, H - (int)pix_min.y);
+
+	const uint32_t tile_id = block.group_index().y * horizontal_blocks + block.group_index().x;
+	bool compute_loss = loss_compute_locally == nullptr || loss_compute_locally[tile_id];
+	compute_loss = compute_loss
+		&& (int)pix_min.y >= gt_image_y_offset
+		&& (int)pix_min.y + tile_h <= gt_image_y_offset + gt_image_height;
+	const uint2 range = ranges[tile_id];
+	const int rounds = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int toDo = range.y - range.x;
+
+	uint32_t bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
+	const int num_buckets = (toDo + 31) / 32;
+	for (int i = 0; i < (num_buckets + BLOCK_SIZE - 1) / BLOCK_SIZE; ++i)
+	{
+		const int bucket_idx = i * BLOCK_SIZE + block.thread_rank();
+		if (bucket_idx < num_buckets)
+			bucket_to_tile[bbm + bucket_idx] = tile_id;
+	}
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_features[CHANNELS * BLOCK_SIZE];
+	__shared__ float s_x[BLOCK_SIZE];
+	__shared__ float s_y[BLOCK_SIZE];
+	__shared__ float s_x2[BLOCK_SIZE];
+	__shared__ float s_y2[BLOCK_SIZE];
+	__shared__ float s_xy[BLOCK_SIZE];
+
+	float T = 1.0f;
+	uint32_t contributor = 0;
+	uint32_t last_contributor = 0;
+	uint32_t thread_n_contrib2loss = 0;
+	float C[CHANNELS] = { 0 };
+	float max_weight = 0.0f;
+	int max_weight_id = -1;
+
+	for (int i = 0; i < rounds; ++i, toDo -= BLOCK_SIZE)
+	{
+		if (__syncthreads_count(done) == BLOCK_SIZE)
+			break;
+
+		const int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			const int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			for (int ch = 0; ch < CHANNELS; ++ch)
+				collected_features[ch * BLOCK_SIZE + block.thread_rank()] =
+					features[coll_id * CHANNELS + ch];
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); ++j)
+		{
+			if (j % 32 == 0)
+			{
+				sampled_T[bbm * BLOCK_SIZE + block.thread_rank()] = T;
+				for (int ch = 0; ch < CHANNELS; ++ch)
+					sampled_ar[bbm * BLOCK_SIZE * CHANNELS + ch * BLOCK_SIZE + block.thread_rank()] = C[ch];
+				++bbm;
+			}
+
+			++contributor;
+			const float2 xy = collected_xy[j];
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const float4 con_o = collected_conic_opacity[j];
+			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y)
+				- con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			const float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			const float test_T = T * (1.0f - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+
+			++thread_n_contrib2loss;
+			const float weight = alpha * T;
+			if (COLLECT_BLUR_STATS && weight > max_weight)
+			{
+				max_weight = weight;
+				max_weight_id = collected_id[j];
+			}
+			for (int ch = 0; ch < CHANNELS; ++ch)
+				C[ch] += collected_features[ch * BLOCK_SIZE + j] * weight;
+			T = test_T;
+			last_contributor = contributor;
+		}
+	}
+	if (COLLECT_BLUR_STATS && max_weight_id >= 0)
+		atomicAdd(&max_contribution_area[max_weight_id], 1.0f);
+
+	float local_l1_loss = 0.0f;
+	float rendered_values[CHANNELS] = { 0.0f };
+	float gt_values[CHANNELS] = { 0.0f };
+	if (inside)
+	{
+		final_T[pix_id] = T;
+		n_contrib[pix_id] = last_contributor;
+		n_contrib2loss[pix_id] = thread_n_contrib2loss;
+		for (int ch = 0; ch < CHANNELS; ++ch)
+		{
+			const uint32_t idx = ch * H * W + pix_id;
+			const float rendered = C[ch] + T * bg_color[ch];
+			out_color[idx] = rendered;
+			if (compute_loss)
+			{
+				const int gt_y = (int)pix.y - gt_image_y_offset;
+				const uint32_t gt_idx = ch * gt_image_height * W + gt_y * W + pix.x;
+				const float gt = gt_image[gt_idx];
+				const float diff = rendered - gt;
+				rendered_values[ch] = fminf(fmaxf(rendered, 0.0f), 1.0f);
+				gt_values[ch] = gt;
+				dL_dpixels[idx] = lambda_l1 *
+					(diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f));
+				local_l1_loss += fabsf(diff);
+			}
+			else
+			{
+				dL_dpixels[idx] = 0.0f;
+			}
+		}
+	}
+
+	if (compute_loss && lambda_ssim > 0.0f)
+	{
+		const int N_valid = tile_w * tile_h;
+		const float N_f = (float)N_valid;
+		const unsigned r = block.thread_rank();
+		if (N_valid >= 4)
+		{
+			const float C1 = 0.01f * 0.01f;
+			const float C2 = 0.03f * 0.03f;
+			for (int ch = 0; ch < CHANNELS; ++ch)
+			{
+				const float x_i = inside ? rendered_values[ch] : 0.0f;
+				const float y_i = inside ? gt_values[ch] : 0.0f;
+				s_x[r] = x_i;
+				s_y[r] = y_i;
+				s_x2[r] = x_i * x_i;
+				s_y2[r] = y_i * y_i;
+				s_xy[r] = x_i * y_i;
+				block.sync();
+
+				for (unsigned s = BLOCK_SIZE / 2; s > 0; s >>= 1)
+				{
+					if (r < s)
+					{
+						s_x[r] += s_x[r + s];
+						s_y[r] += s_y[r + s];
+						s_x2[r] += s_x2[r + s];
+						s_y2[r] += s_y2[r + s];
+						s_xy[r] += s_xy[r + s];
+					}
+					block.sync();
+				}
+
+				const float sum_x = s_x[0];
+				const float sum_y = s_y[0];
+				const float mu_x = sum_x / N_f;
+				const float mu_y = sum_y / N_f;
+				const float sigma_x2 = s_x2[0] / N_f - mu_x * mu_x;
+				const float sigma_y2 = s_y2[0] / N_f - mu_y * mu_y;
+				const float sigma_xy = s_xy[0] / N_f - mu_x * mu_y;
+				const float num1 = 2.0f * mu_x * mu_y + C1;
+				const float num2 = 2.0f * sigma_xy + C2;
+				const float den1 = mu_x * mu_x + mu_y * mu_y + C1;
+				const float den2 = sigma_x2 + sigma_y2 + C2;
+				const float ssim_ch = num1 * num2 / (den1 * den2);
+				if (r == 0)
+					atomicAdd(out_loss, lambda_ssim * N_f * (1.0f - ssim_ch));
+
+				if (inside)
+				{
+					const float inv_den1 = 1.0f / den1;
+					const float inv_den2 = 1.0f / den2;
+					const float dSSIM_dmu_x = (num2 * inv_den2) * inv_den1 * (2.0f * mu_y)
+						- (num1 * num2) * (inv_den1 * inv_den1 * inv_den2) * (2.0f * mu_x);
+					const float dSSIM_dsigma_x2 = -ssim_ch * inv_den2;
+					const float dSSIM_dsigma_xy = 2.0f * num1 * inv_den1 * inv_den2;
+					const float grad = dSSIM_dmu_x
+						+ dSSIM_dsigma_x2 * 2.0f * (x_i - mu_x)
+						+ dSSIM_dsigma_xy * (y_i - mu_y);
+					dL_dpixels[ch * H * W + pix_id] += -lambda_ssim * grad;
+				}
+				block.sync();
+			}
+		}
+	}
+
+	typedef cub::BlockReduce<uint32_t, BLOCK_X, cub::BLOCK_REDUCE_WARP_REDUCTIONS, BLOCK_Y> BlockReduceUint;
+	__shared__ typename BlockReduceUint::TempStorage uint_temp_storage;
+	last_contributor = BlockReduceUint(uint_temp_storage).Reduce(last_contributor, cub::Max());
+	if (block.thread_rank() == 0)
+		max_contrib[tile_id] = last_contributor;
+
+	typedef cub::BlockReduce<float, BLOCK_X, cub::BLOCK_REDUCE_WARP_REDUCTIONS, BLOCK_Y> BlockReduceFloat;
+	__shared__ typename BlockReduceFloat::TempStorage float_temp_storage;
+	const float block_l1_loss = BlockReduceFloat(float_temp_storage).Sum(local_l1_loss);
+	if (block.thread_rank() == 0)
+		atomicAdd(out_loss, lambda_l1 * block_l1_loss);
+}
+
+template <uint32_t CHANNELS, bool COLLECT_BLUR_STATS>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderL1FusedPerGaussianCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	const uint32_t* __restrict__ per_tile_bucket_offset,
+	uint32_t* __restrict__ bucket_to_tile,
+	float* __restrict__ sampled_T,
+	float* __restrict__ sampled_ar,
+	int W, int H,
+	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ features,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	uint32_t* __restrict__ max_contrib,
+	uint32_t* __restrict__ n_contrib2loss,
+	const float* __restrict__ bg_color,
+	const float* __restrict__ gt_image,
+	int gt_image_y_offset,
+	int gt_image_height,
+	const bool* __restrict__ loss_compute_locally,
+	float lambda_l1,
+	float lambda_ssim,
+	float* __restrict__ out_loss,
+	float* __restrict__ out_color,
+	float2* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dconic_opacity,
+	float* __restrict__ dL_dcolors,
+	float* __restrict__ max_contribution_area)
+{
+	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
@@ -773,12 +1025,7 @@ renderL1CUDA(
 
 	uint32_t bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
 	int num_buckets = (toDo + 31) / 32;
-	for (int i = 0; i < (num_buckets + BLOCK_SIZE - 1) / BLOCK_SIZE; ++i)
-	{
-		int bucket_idx = i * BLOCK_SIZE + block.thread_rank();
-		if (bucket_idx < num_buckets)
-			bucket_to_tile[bbm + bucket_idx] = tile_id;
-	}
+	(void)bucket_to_tile;
 
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
@@ -866,6 +1113,7 @@ renderL1CUDA(
 	float local_l1_loss = 0.0f;
 	float rendered_values[CHANNELS] = { 0.0f };
 	float gt_values[CHANNELS] = { 0.0f };
+	float pixel_dL[CHANNELS] = { 0.0f };
 	if (inside)
 	{
 		final_T[pix_id] = T;
@@ -884,12 +1132,8 @@ renderL1CUDA(
 				const float diff = rendered - gt;
 				rendered_values[ch] = fminf(fmaxf(rendered, 0.0f), 1.0f);
 				gt_values[ch] = gt;
-				dL_dpixels[idx] = lambda_l1 * (diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f));
+				pixel_dL[ch] = lambda_l1 * (diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f));
 				local_l1_loss += fabsf(diff);
-			}
-			else
-			{
-				dL_dpixels[idx] = 0.0f;
 			}
 		}
 	}
@@ -965,7 +1209,7 @@ renderL1CUDA(
 					const float grad = dSSIM_dmu_x
 						+ dSSIM_dsigma_x2 * 2.0f * (x_i - mu_x)
 						+ dSSIM_dsigma_xy * (y_i - mu_y);
-					dL_dpixels[ch * H * W + pix_id] += -lambda_ssim * grad;
+					pixel_dL[ch] += -lambda_ssim * grad;
 				}
 				block.sync();
 			}
@@ -984,6 +1228,152 @@ renderL1CUDA(
 	if (block.thread_rank() == 0)
 	{
 		atomicAdd(out_loss, lambda_l1 * block_l1_loss);
+	}
+
+	// The forward Gaussian cache is dead at this point. Reuse its storage for
+	// per-pixel loss gradients consumed by the per-Gaussian phase below.
+	block.sync();
+	for (int ch = 0; ch < CHANNELS; ++ch)
+		collected_features[ch * BLOCK_SIZE + block.thread_rank()] = pixel_dL[ch];
+	block.sync();
+
+	if (!compute_loss || num_buckets == 0)
+		return;
+
+	// Adapt the original warp-per-bucket PerGaussianRenderCUDA organization to
+	// this tile-owned block. Eight warps cooperatively walk all buckets of the
+	// current tile, so no grid-wide synchronization is needed between phases.
+	auto warp = cg::tiled_partition<32>(block);
+	const int lane = warp.thread_rank();
+	const int warps_per_block = warp.meta_group_size();
+	const int warp_id = warp.meta_group_rank();
+	const float ddelx_dx = 0.5f * W;
+	const float ddely_dy = 0.5f * H;
+	const uint32_t first_bucket = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
+
+	for (int bucket_idx = warp_id; bucket_idx < num_buckets; bucket_idx += warps_per_block)
+	{
+		if (bucket_idx * 32 >= (int)max_contrib[tile_id])
+			continue;
+
+		const uint32_t global_bucket_idx = first_bucket + bucket_idx;
+		const int splat_idx_in_tile = bucket_idx * 32 + lane;
+		const int splat_idx_global = range.x + splat_idx_in_tile;
+		const bool valid_splat = splat_idx_in_tile < (int)(range.y - range.x);
+
+		int gaussian_idx = 0;
+		float2 xy = { 0.0f, 0.0f };
+		float4 con_o = { 0.0f, 0.0f, 0.0f, 0.0f };
+		float color[CHANNELS] = { 0.0f };
+		if (valid_splat)
+		{
+			gaussian_idx = point_list[splat_idx_global];
+			xy = points_xy_image[gaussian_idx];
+			con_o = conic_opacity[gaussian_idx];
+			for (int ch = 0; ch < CHANNELS; ++ch)
+				color[ch] = features[gaussian_idx * CHANNELS + ch];
+		}
+
+		float grad_mean_x = 0.0f;
+		float grad_mean_y = 0.0f;
+		float grad_conic_x = 0.0f;
+		float grad_conic_y = 0.0f;
+		float grad_conic_z = 0.0f;
+		float grad_opacity = 0.0f;
+		float grad_color[CHANNELS] = { 0.0f };
+		float prefix_T = 0.0f;
+		float final_pixel_T = 0.0f;
+		int pixel_last_contributor = 0;
+		float accumulated_remainder[CHANNELS] = { 0.0f };
+		float pixel_loss_grad[CHANNELS] = { 0.0f };
+
+		for (int i = 0; i < BLOCK_SIZE + 31; ++i)
+		{
+			prefix_T = warp.shfl_up(prefix_T, 1);
+			final_pixel_T = warp.shfl_up(final_pixel_T, 1);
+			pixel_last_contributor = warp.shfl_up(pixel_last_contributor, 1);
+			for (int ch = 0; ch < CHANNELS; ++ch)
+			{
+				accumulated_remainder[ch] = warp.shfl_up(accumulated_remainder[ch], 1);
+				pixel_loss_grad[ch] = warp.shfl_up(pixel_loss_grad[ch], 1);
+			}
+
+			const int pixel_in_tile = i - lane;
+			const uint2 backward_pix = {
+				pix_min.x + pixel_in_tile % BLOCK_X,
+				pix_min.y + pixel_in_tile / BLOCK_X
+			};
+			const bool valid_pixel = pixel_in_tile >= 0 && pixel_in_tile < BLOCK_SIZE
+				&& backward_pix.x < (uint32_t)W && backward_pix.y < (uint32_t)H;
+			const uint32_t backward_pix_id = W * backward_pix.y + backward_pix.x;
+
+			if (lane == 0 && valid_pixel)
+			{
+				prefix_T = sampled_T[global_bucket_idx * BLOCK_SIZE + pixel_in_tile];
+				final_pixel_T = final_T[backward_pix_id];
+				pixel_last_contributor = n_contrib[backward_pix_id];
+				for (int ch = 0; ch < CHANNELS; ++ch)
+				{
+					accumulated_remainder[ch] =
+						-(out_color[ch * H * W + backward_pix_id] - final_pixel_T * bg_color[ch])
+						+ sampled_ar[global_bucket_idx * BLOCK_SIZE * CHANNELS
+							+ ch * BLOCK_SIZE + pixel_in_tile];
+					pixel_loss_grad[ch] = collected_features[ch * BLOCK_SIZE + pixel_in_tile];
+				}
+			}
+
+			if (!valid_splat || !valid_pixel || splat_idx_in_tile >= pixel_last_contributor)
+				continue;
+
+			const float2 backward_pixf = { (float)backward_pix.x, (float)backward_pix.y };
+			const float2 d = { xy.x - backward_pixf.x, xy.y - backward_pixf.y };
+			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y)
+				- con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+			const float G = exp(power);
+			const float alpha = min(0.99f, con_o.w * G);
+			if (alpha < 1.0f / 255.0f)
+				continue;
+
+			const float dchannel_dcolor = alpha * prefix_T;
+			float bg_dot_grad = 0.0f;
+			float dL_dalpha = 0.0f;
+			for (int ch = 0; ch < CHANNELS; ++ch)
+			{
+				accumulated_remainder[ch] += prefix_T * alpha * color[ch];
+				grad_color[ch] += dchannel_dcolor * pixel_loss_grad[ch];
+				dL_dalpha += (color[ch] * prefix_T
+					- (-accumulated_remainder[ch]) / (1.0f - alpha)) * pixel_loss_grad[ch];
+				bg_dot_grad += bg_color[ch] * pixel_loss_grad[ch];
+			}
+			dL_dalpha += (-final_pixel_T / (1.0f - alpha)) * bg_dot_grad;
+			prefix_T *= (1.0f - alpha);
+
+			const float dL_dG = con_o.w * dL_dalpha;
+			const float gdx = G * d.x;
+			const float gdy = G * d.y;
+			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+			grad_mean_x += dL_dG * dG_ddelx * ddelx_dx;
+			grad_mean_y += dL_dG * dG_ddely * ddely_dy;
+			grad_conic_x += -0.5f * gdx * d.x * dL_dG;
+			grad_conic_y += -0.5f * gdx * d.y * dL_dG;
+			grad_conic_z += -0.5f * gdy * d.y * dL_dG;
+			grad_opacity += G * dL_dalpha;
+		}
+
+		if (valid_splat)
+		{
+			atomicAdd(&dL_dmean2D[gaussian_idx].x, grad_mean_x);
+			atomicAdd(&dL_dmean2D[gaussian_idx].y, grad_mean_y);
+			atomicAdd(&dL_dconic_opacity[gaussian_idx].x, grad_conic_x);
+			atomicAdd(&dL_dconic_opacity[gaussian_idx].y, grad_conic_y);
+			atomicAdd(&dL_dconic_opacity[gaussian_idx].z, grad_conic_z);
+			atomicAdd(&dL_dconic_opacity[gaussian_idx].w, grad_opacity);
+			for (int ch = 0; ch < CHANNELS; ++ch)
+				atomicAdd(&dL_dcolors[gaussian_idx * CHANNELS + ch], grad_color[ch]);
+		}
 	}
 }
 
@@ -1016,34 +1406,54 @@ void FORWARD::render_l1(
 	float* max_contribution_area)
 {
 	if (max_contribution_area != nullptr)
-		renderL1CUDA<NUM_CHANNELS, true> << <grid, block >> > (
-			ranges,
-			point_list,
-			per_tile_bucket_offset,
-			bucket_to_tile,
-			sampled_T,
-			sampled_ar,
-			W, H,
-			means2D,
-			colors,
-			conic_opacity,
-			final_T,
-			n_contrib,
-			max_contrib,
-			n_contrib2loss,
-			bg_color,
-			gt_image,
-			gt_image_y_offset,
-			gt_image_height,
-			loss_compute_locally,
-			lambda_l1,
-			lambda_ssim,
-			out_loss,
-			out_color,
-			dL_dpixels,
+		renderL1CUDA<NUM_CHANNELS, true><<<grid, block>>>(
+			ranges, point_list, per_tile_bucket_offset, bucket_to_tile,
+			sampled_T, sampled_ar, W, H, means2D, colors, conic_opacity,
+			final_T, n_contrib, max_contrib, n_contrib2loss, bg_color,
+			gt_image, gt_image_y_offset, gt_image_height, loss_compute_locally,
+			lambda_l1, lambda_ssim, out_loss, out_color, dL_dpixels,
 			max_contribution_area);
 	else
-		renderL1CUDA<NUM_CHANNELS, false> << <grid, block >> > (
+		renderL1CUDA<NUM_CHANNELS, false><<<grid, block>>>(
+			ranges, point_list, per_tile_bucket_offset, bucket_to_tile,
+			sampled_T, sampled_ar, W, H, means2D, colors, conic_opacity,
+			final_T, n_contrib, max_contrib, n_contrib2loss, bg_color,
+			gt_image, gt_image_y_offset, gt_image_height, loss_compute_locally,
+			lambda_l1, lambda_ssim, out_loss, out_color, dL_dpixels, nullptr);
+}
+
+void FORWARD::render_l1_fused_per_gaussian(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	const uint32_t* per_tile_bucket_offset,
+	uint32_t* bucket_to_tile,
+	float* sampled_T,
+	float* sampled_ar,
+	int W, int H,
+	const float2* means2D,
+	const float* colors,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	uint32_t* max_contrib,
+	uint32_t* n_contrib2loss,
+	const float* bg_color,
+	const float* gt_image,
+	int gt_image_y_offset,
+	int gt_image_height,
+	const bool* loss_compute_locally,
+	float lambda_l1,
+	float lambda_ssim,
+	float* out_loss,
+	float* out_color,
+	float2* dL_dmean2D,
+	float4* dL_dconic_opacity,
+	float* dL_dcolors,
+	float* max_contribution_area)
+{
+	if (max_contribution_area != nullptr)
+		renderL1FusedPerGaussianCUDA<NUM_CHANNELS, true> << <grid, block >> > (
 			ranges,
 			point_list,
 			per_tile_bucket_offset,
@@ -1067,7 +1477,38 @@ void FORWARD::render_l1(
 			lambda_ssim,
 			out_loss,
 			out_color,
-			dL_dpixels,
+			dL_dmean2D,
+			dL_dconic_opacity,
+			dL_dcolors,
+			max_contribution_area);
+	else
+		renderL1FusedPerGaussianCUDA<NUM_CHANNELS, false> << <grid, block >> > (
+			ranges,
+			point_list,
+			per_tile_bucket_offset,
+			bucket_to_tile,
+			sampled_T,
+			sampled_ar,
+			W, H,
+			means2D,
+			colors,
+			conic_opacity,
+			final_T,
+			n_contrib,
+			max_contrib,
+			n_contrib2loss,
+			bg_color,
+			gt_image,
+			gt_image_y_offset,
+			gt_image_height,
+			loss_compute_locally,
+			lambda_l1,
+			lambda_ssim,
+			out_loss,
+			out_color,
+			dL_dmean2D,
+			dL_dconic_opacity,
+			dL_dcolors,
 			nullptr);
 }
 
