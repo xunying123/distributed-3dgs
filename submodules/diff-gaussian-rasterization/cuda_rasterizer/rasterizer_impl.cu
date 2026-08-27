@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <numeric>
 #include <string>
+#include <sstream>
+#include <stdexcept>
 #include <cstdlib>
 #include <cfloat>
 #include <chrono>
@@ -119,75 +121,348 @@ __device__ inline float max_contrib_power_rect_gaussian_float(
 	return max_contrib_power;
 }
 
-// Generates one key/value pair for all Gaussian / tile overlaps. 
-// Run once per Gaussian (1:N mapping).
+__device__ __forceinline__ void duplicateGaussianSerialInRect(
+	const uint32_t idx,
+	const float2* __restrict__ points_xy,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ depths,
+	const uint32_t* __restrict__ offsets,
+	uint64_t* __restrict__ gaussian_keys_unsorted,
+	uint32_t* __restrict__ gaussian_values_unsorted,
+	const bool* __restrict__ compute_locally,
+	const dim3 grid,
+	const uint2 rect_min,
+	const uint2 rect_max)
+{
+	uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+	const uint32_t offset_to = offsets[idx];
+	const float2 xy = points_xy[idx];
+	const float4 co = conic_opacity[idx];
+	const float opacity_threshold = 1.0f / 255.0f;
+	const float opacity_factor_threshold = logf(co.w / opacity_threshold);
+
+	for (int y = rect_min.y; y < rect_max.y; y++)
+	{
+		for (int x = rect_min.x; x < rect_max.x; x++)
+		{
+			if (!compute_locally[y * grid.x + x])
+				continue;
+
+			const glm::vec2 tile_min(x * BLOCK_X, y * BLOCK_Y);
+			const glm::vec2 tile_max((x + 1) * BLOCK_X - 1, (y + 1) * BLOCK_Y - 1);
+			glm::vec2 max_pos;
+			const float max_opac_factor = max_contrib_power_rect_gaussian_float<BLOCK_X - 1, BLOCK_Y - 1>(
+				co, xy, tile_min, tile_max, max_pos);
+			if (max_opac_factor <= opacity_factor_threshold)
+			{
+				uint64_t key = y * grid.x + x;
+				key <<= 32;
+				key |= __float_as_uint(depths[idx]);
+				gaussian_keys_unsorted[off] = key;
+				gaussian_values_unsorted[off] = idx;
+				++off;
+			}
+		}
+	}
+
+	for (; off < offset_to; ++off)
+	{
+		uint64_t key = static_cast<uint32_t>(-1);
+		key <<= 32;
+		key |= __float_as_uint(FLT_MAX);
+		gaussian_values_unsorted[off] = static_cast<uint32_t>(-1);
+		gaussian_keys_unsorted[off] = key;
+	}
+}
+
+__device__ __forceinline__ void duplicateGaussianSerial(
+	const uint32_t idx,
+	const float2* __restrict__ points_xy,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ depths,
+	const uint32_t* __restrict__ offsets,
+	uint64_t* __restrict__ gaussian_keys_unsorted,
+	uint32_t* __restrict__ gaussian_values_unsorted,
+	const int* __restrict__ radii,
+	const bool* __restrict__ compute_locally,
+	const dim3 grid)
+{
+	if (radii[idx] <= 0)
+		return;
+
+	uint2 rect_min, rect_max;
+	getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+	duplicateGaussianSerialInRect(
+		idx, points_xy, conic_opacity, depths, offsets,
+		gaussian_keys_unsorted, gaussian_values_unsorted,
+		compute_locally, grid, rect_min, rect_max);
+}
+
+// Baseline one-thread-per-Gaussian implementation used for A/B comparison.
 __global__ void duplicateWithKeys(
 	int P,
-	const float2* points_xy,
+	const float2* __restrict__ points_xy,
 	const float4* __restrict__ conic_opacity,
-	const float* depths,
-	const uint32_t* offsets,
-	uint64_t* gaussian_keys_unsorted,
-	uint32_t* gaussian_values_unsorted,
-	int* radii,
-	bool* compute_locally,
+	const float* __restrict__ depths,
+	const uint32_t* __restrict__ offsets,
+	uint64_t* __restrict__ gaussian_keys_unsorted,
+	uint32_t* __restrict__ gaussian_values_unsorted,
+	const int* __restrict__ radii,
+	const bool* __restrict__ compute_locally,
 	dim3 grid)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;
 
-	// Generate no key/value pair for invisible Gaussians
-	if (radii[idx] > 0)
+	duplicateGaussianSerial(
+		idx, points_xy, conic_opacity, depths, offsets,
+		gaussian_keys_unsorted, gaussian_values_unsorted,
+		radii, compute_locally, grid);
+}
+
+static_assert(ONE_DIM_BLOCK_SIZE % 32 == 0, "warp-cohort duplicate requires full warps");
+__global__ void duplicateWithKeysWarpCohort(
+	int P,
+	const float2* __restrict__ points_xy,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ depths,
+	const uint32_t* __restrict__ offsets,
+	uint64_t* __restrict__ gaussian_keys_unsorted,
+	uint32_t* __restrict__ gaussian_values_unsorted,
+	const int* __restrict__ radii,
+	const bool* __restrict__ compute_locally,
+	dim3 grid,
+	int local_tile_threshold,
+	int candidate_tile_threshold)
+{
+	constexpr unsigned FULL_WARP_MASK = 0xffffffffu;
+	constexpr int WARP_SIZE = 32;
+	const int lane = threadIdx.x & (WARP_SIZE - 1);
+	const uint32_t idx = cg::this_grid().thread_rank();
+	const bool in_range = idx < P;
+
+	uint32_t offset_from = 0;
+	uint32_t offset_to = 0;
+	uint2 lane_rect_min = { 0, 0 };
+	uint2 lane_rect_max = { 0, 0 };
+	int candidate_count = 0;
+	bool has_work = false;
+	if (in_range && radii[idx] > 0)
 	{
-		// Find this Gaussian's offset in buffer for writing keys/values.
-		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
-		const uint32_t offset_to = offsets[idx];
-		uint2 rect_min, rect_max;
+		offset_from = (idx == 0) ? 0 : offsets[idx - 1];
+		offset_to = offsets[idx];
+		has_work = offset_to > offset_from;
+		if (has_work)
+		{
+			getRect(points_xy[idx], radii[idx], lane_rect_min, lane_rect_max, grid);
+			candidate_count = (lane_rect_max.x - lane_rect_min.x) *
+				(lane_rect_max.y - lane_rect_min.y);
+		}
+	}
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
-		const float2 xy = points_xy[idx];
-		const float4 co = conic_opacity[idx];
-		const float opacity_threshold = 1.0f / 255.0f;
-		const float opacity_factor_threshold = logf(co.w / opacity_threshold);
+	const bool is_large = has_work && (
+		offset_to - offset_from > local_tile_threshold ||
+		candidate_count > candidate_tile_threshold);
+	if (has_work && !is_large)
+	{
+		duplicateGaussianSerialInRect(
+			idx, points_xy, conic_opacity, depths, offsets,
+			gaussian_keys_unsorted, gaussian_values_unsorted,
+			compute_locally, grid, lane_rect_min, lane_rect_max);
+	}
 
-		// For each tile that the bounding rect overlaps, emit a 
-		// key/value pair. The key is |  tile ID  |      depth      |,
-		// and the value is the ID of the Gaussian. Sorting the values 
-		// with this key yields Gaussian IDs in a list, such that they
-		// are first sorted by tile and then by depth. 
-		for (int y = rect_min.y; y < rect_max.y; y++)
-		{//TODO: this has a small problem when rect_min.y == rect_max.y; this is also a reasonable case.
-			for (int x = rect_min.x; x < rect_max.x; x++)
-			if (compute_locally[y * grid.x + x])
-			{
-				const glm::vec2 tile_min(x * BLOCK_X, y * BLOCK_Y);
-				const glm::vec2 tile_max((x + 1) * BLOCK_X - 1, (y + 1) * BLOCK_Y - 1);
-				glm::vec2 max_pos;
-				const float max_opac_factor = max_contrib_power_rect_gaussian_float<BLOCK_X - 1, BLOCK_Y - 1>(
-					co, xy, tile_min, tile_max, max_pos);
-				if (max_opac_factor <= opacity_factor_threshold)
-				{
-					uint64_t key = y * grid.x + x;
-					key <<= 32;
-					key |= *((uint32_t*)&depths[idx]);
-					gaussian_keys_unsorted[off] = key;
-					gaussian_values_unsorted[off] = idx;
-					off++;
-				}
-			}
+	unsigned large_mask = __ballot_sync(FULL_WARP_MASK, is_large);
+	while (large_mask != 0)
+	{
+		const int source_lane = __ffs(large_mask) - 1;
+		const uint32_t gaussian_idx = __shfl_sync(FULL_WARP_MASK, idx, source_lane);
+		const uint32_t gaussian_offset_from = __shfl_sync(FULL_WARP_MASK, offset_from, source_lane);
+		const uint32_t gaussian_offset_to = __shfl_sync(FULL_WARP_MASK, offset_to, source_lane);
+
+		float2 xy_local = { 0.0f, 0.0f };
+		float4 co_local = { 0.0f, 0.0f, 0.0f, 0.0f };
+		uint32_t depth_bits_local = 0;
+		if (lane == source_lane)
+		{
+			xy_local = points_xy[gaussian_idx];
+			co_local = conic_opacity[gaussian_idx];
+			depth_bits_local = __float_as_uint(depths[gaussian_idx]);
 		}
 
-		// Keep fixed-size slots by filling culled entries with invalid keys.
-		for (; off < offset_to; ++off)
+		const float2 xy = {
+			__shfl_sync(FULL_WARP_MASK, xy_local.x, source_lane),
+			__shfl_sync(FULL_WARP_MASK, xy_local.y, source_lane)
+		};
+		const float4 co = {
+			__shfl_sync(FULL_WARP_MASK, co_local.x, source_lane),
+			__shfl_sync(FULL_WARP_MASK, co_local.y, source_lane),
+			__shfl_sync(FULL_WARP_MASK, co_local.z, source_lane),
+			__shfl_sync(FULL_WARP_MASK, co_local.w, source_lane)
+		};
+		const uint32_t depth_bits = __shfl_sync(FULL_WARP_MASK, depth_bits_local, source_lane);
+		const uint2 rect_min = {
+			__shfl_sync(FULL_WARP_MASK, lane_rect_min.x, source_lane),
+			__shfl_sync(FULL_WARP_MASK, lane_rect_min.y, source_lane)
+		};
+		const uint2 rect_max = {
+			__shfl_sync(FULL_WARP_MASK, lane_rect_max.x, source_lane),
+			__shfl_sync(FULL_WARP_MASK, lane_rect_max.y, source_lane)
+		};
+
+		const int rect_width = rect_max.x - rect_min.x;
+		const int rect_height = rect_max.y - rect_min.y;
+		const int rect_candidate_count = rect_width * rect_height;
+		const float opacity_factor_threshold = logf(co.w / (1.0f / 255.0f));
+		uint32_t write_offset = gaussian_offset_from;
+
+		for (int base = 0; base < rect_candidate_count; base += WARP_SIZE)
+		{
+			const int candidate = base + lane;
+			bool emit = false;
+			int x = 0;
+			int y = 0;
+			if (candidate < rect_candidate_count)
+			{
+				x = rect_min.x + candidate % rect_width;
+				y = rect_min.y + candidate / rect_width;
+				if (compute_locally[y * grid.x + x])
+				{
+					const glm::vec2 tile_min(x * BLOCK_X, y * BLOCK_Y);
+					const glm::vec2 tile_max((x + 1) * BLOCK_X - 1, (y + 1) * BLOCK_Y - 1);
+					glm::vec2 max_pos;
+					const float max_opac_factor = max_contrib_power_rect_gaussian_float<BLOCK_X - 1, BLOCK_Y - 1>(
+						co, xy, tile_min, tile_max, max_pos);
+					emit = max_opac_factor <= opacity_factor_threshold;
+				}
+			}
+
+			const unsigned emit_mask = __ballot_sync(FULL_WARP_MASK, emit);
+			const uint32_t lane_mask = (1u << lane) - 1u;
+			const uint32_t lane_offset = __popc(emit_mask & lane_mask);
+			if (emit)
+			{
+				uint64_t key = y * grid.x + x;
+				key <<= 32;
+				key |= depth_bits;
+				gaussian_keys_unsorted[write_offset + lane_offset] = key;
+				gaussian_values_unsorted[write_offset + lane_offset] = gaussian_idx;
+			}
+			write_offset += __popc(emit_mask);
+		}
+
+		for (uint32_t off = write_offset + lane; off < gaussian_offset_to; off += WARP_SIZE)
 		{
 			uint64_t key = static_cast<uint32_t>(-1);
 			key <<= 32;
-			const float depth = FLT_MAX;
-			key |= *((uint32_t*)&depth);
+			key |= __float_as_uint(FLT_MAX);
 			gaussian_values_unsorted[off] = static_cast<uint32_t>(-1);
 			gaussian_keys_unsorted[off] = key;
 		}
+
+		large_mask &= ~(1u << source_lane);
+	}
+}
+
+enum class DuplicateBackend
+{
+	Baseline,
+	WarpCohort,
+};
+
+struct DuplicateConfig
+{
+	DuplicateBackend backend;
+	int warp_threshold;
+	int warp_candidate_threshold;
+	bool validate;
+	int validate_start_iteration;
+	int validate_end_iteration;
+	int validate_max_calls;
+};
+
+template<typename T>
+T getDuplicateArg(
+	const pybind11::dict& args,
+	const char* key,
+	const T& default_value)
+{
+	const pybind11::str py_key(key);
+	if (!args.contains(py_key))
+		return default_value;
+	return pybind11::cast<T>(args[py_key]);
+}
+
+DuplicateConfig getDuplicateConfig(const pybind11::dict& args)
+{
+	const std::string backend_name =
+		getDuplicateArg<std::string>(args, "duplicate_backend", "baseline");
+	DuplicateBackend backend;
+	if (backend_name == "baseline")
+		backend = DuplicateBackend::Baseline;
+	else if (backend_name == "warp_cohort")
+		backend = DuplicateBackend::WarpCohort;
+	else
+		throw std::runtime_error(
+			"duplicate_backend must be 'baseline' or 'warp_cohort'");
+
+	DuplicateConfig config = {
+		backend,
+		getDuplicateArg<int>(args, "duplicate_warp_threshold", 32),
+		getDuplicateArg<int>(args, "duplicate_warp_candidate_threshold", 128),
+		getDuplicateArg<bool>(args, "duplicate_validate", false),
+		getDuplicateArg<int>(args, "duplicate_validate_start_iteration", 0),
+		getDuplicateArg<int>(args, "duplicate_validate_end_iteration", 0),
+		getDuplicateArg<int>(args, "duplicate_validate_max_calls", 1),
+	};
+	if (config.warp_threshold <= 0 || config.warp_candidate_threshold <= 0)
+		throw std::runtime_error("duplicate warp thresholds must be positive");
+	if (config.validate && config.backend != DuplicateBackend::WarpCohort)
+		throw std::runtime_error(
+			"duplicate validation requires the warp_cohort backend");
+	if (config.validate_start_iteration < 0 || config.validate_end_iteration < 0)
+		throw std::runtime_error(
+			"duplicate validation iterations must be non-negative");
+	if (config.validate_end_iteration > 0 &&
+		config.validate_end_iteration < config.validate_start_iteration)
+		throw std::runtime_error(
+			"duplicate validation end iteration precedes its start iteration");
+	if (config.validate_max_calls <= 0)
+		throw std::runtime_error("duplicate_validate_max_calls must be positive");
+	return config;
+}
+
+void launchDuplicateWithKeys(
+	int P,
+	const float2* points_xy,
+	const float4* conic_opacity,
+	const float* depths,
+	const uint32_t* offsets,
+	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_values_unsorted,
+	const int* radii,
+	const bool* compute_locally,
+	dim3 grid,
+	const DuplicateConfig& config)
+{
+	if (config.backend == DuplicateBackend::WarpCohort)
+	{
+		duplicateWithKeysWarpCohort<<<
+			(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE,
+			ONE_DIM_BLOCK_SIZE>>>(
+			P, points_xy, conic_opacity, depths, offsets,
+			gaussian_keys_unsorted, gaussian_values_unsorted,
+			radii, compute_locally, grid,
+			config.warp_threshold, config.warp_candidate_threshold);
+	}
+	else
+	{
+		duplicateWithKeys<<<
+			(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE,
+			ONE_DIM_BLOCK_SIZE>>>(
+			P, points_xy, conic_opacity, depths, offsets,
+			gaussian_keys_unsorted, gaussian_values_unsorted,
+			radii, compute_locally, grid);
 	}
 }
 
@@ -307,6 +582,245 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 		binning.point_list_unsorted, binning.point_list, P);
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
 	return binning;
+}
+
+struct DuplicateValidationResult
+{
+	unsigned long long baseline_valid_count;
+	unsigned long long candidate_valid_count;
+	unsigned long long baseline_malformed_count;
+	unsigned long long candidate_malformed_count;
+	unsigned long long unsorted_key_mismatches;
+	unsigned long long unsorted_value_mismatches;
+	unsigned long long sorted_key_mismatches;
+	unsigned long long sorted_value_mismatches;
+	unsigned long long first_unsorted_key_mismatch;
+	unsigned long long first_unsorted_value_mismatch;
+	unsigned long long first_sorted_key_mismatch;
+	unsigned long long first_sorted_value_mismatch;
+};
+
+__global__ void compareDuplicateOutputs(
+	int count,
+	const uint64_t* baseline_keys_unsorted,
+	const uint32_t* baseline_values_unsorted,
+	const uint64_t* baseline_keys_sorted,
+	const uint32_t* baseline_values_sorted,
+	const uint64_t* candidate_keys_unsorted,
+	const uint32_t* candidate_values_unsorted,
+	const uint64_t* candidate_keys_sorted,
+	const uint32_t* candidate_values_sorted,
+	DuplicateValidationResult* result)
+{
+	const int idx = cg::this_grid().thread_rank();
+	if (idx >= count)
+		return;
+
+	const bool baseline_key_valid =
+		static_cast<uint32_t>(baseline_keys_unsorted[idx] >> 32) != static_cast<uint32_t>(-1);
+	const bool candidate_key_valid =
+		static_cast<uint32_t>(candidate_keys_unsorted[idx] >> 32) != static_cast<uint32_t>(-1);
+	const bool baseline_value_valid = baseline_values_unsorted[idx] != static_cast<uint32_t>(-1);
+	const bool candidate_value_valid = candidate_values_unsorted[idx] != static_cast<uint32_t>(-1);
+
+	if (baseline_key_valid && baseline_value_valid)
+		atomicAdd(&result->baseline_valid_count, 1ull);
+	if (candidate_key_valid && candidate_value_valid)
+		atomicAdd(&result->candidate_valid_count, 1ull);
+	if (baseline_key_valid != baseline_value_valid)
+		atomicAdd(&result->baseline_malformed_count, 1ull);
+	if (candidate_key_valid != candidate_value_valid)
+		atomicAdd(&result->candidate_malformed_count, 1ull);
+
+	if (baseline_keys_unsorted[idx] != candidate_keys_unsorted[idx])
+	{
+		atomicAdd(&result->unsorted_key_mismatches, 1ull);
+		atomicMin(&result->first_unsorted_key_mismatch, static_cast<unsigned long long>(idx));
+	}
+	if (baseline_values_unsorted[idx] != candidate_values_unsorted[idx])
+	{
+		atomicAdd(&result->unsorted_value_mismatches, 1ull);
+		atomicMin(&result->first_unsorted_value_mismatch, static_cast<unsigned long long>(idx));
+	}
+	if (baseline_keys_sorted[idx] != candidate_keys_sorted[idx])
+	{
+		atomicAdd(&result->sorted_key_mismatches, 1ull);
+		atomicMin(&result->first_sorted_key_mismatch, static_cast<unsigned long long>(idx));
+	}
+	if (baseline_values_sorted[idx] != candidate_values_sorted[idx])
+	{
+		atomicAdd(&result->sorted_value_mismatches, 1ull);
+		atomicMin(&result->first_sorted_value_mismatch, static_cast<unsigned long long>(idx));
+	}
+}
+
+void checkDuplicateValidationCuda(cudaError_t error, const char* operation)
+{
+	if (error == cudaSuccess)
+		return;
+
+	std::ostringstream message;
+	message << "duplicate validation CUDA failure in " << operation << ": "
+		<< cudaGetErrorString(error);
+	throw std::runtime_error(message.str());
+}
+
+bool shouldValidateDuplicateOutputs(
+	const DuplicateConfig& config,
+	int iteration)
+{
+	if (!config.validate)
+		return false;
+	if (config.validate_start_iteration > 0 &&
+		iteration < config.validate_start_iteration)
+		return false;
+	if (config.validate_end_iteration > 0 &&
+		iteration > config.validate_end_iteration)
+		return false;
+
+	static int validation_calls = 0;
+	if (validation_calls >= config.validate_max_calls)
+		return false;
+
+	++validation_calls;
+	return true;
+}
+
+void validateDuplicateOutputs(
+	int P,
+	const float2* points_xy,
+	const float4* conic_opacity,
+	const float* depths,
+	const uint32_t* offsets,
+	const int* radii,
+	const bool* compute_locally,
+	dim3 grid,
+	int num_rendered,
+	int sort_end_bit,
+	const CudaRasterizer::BinningState& candidate,
+	int global_rank,
+	int iteration,
+	const DuplicateConfig& config)
+{
+	if (!shouldValidateDuplicateOutputs(config, iteration))
+		return;
+
+	if (num_rendered == 0)
+	{
+		std::cout << "DGR_DUPLICATE_VALIDATE PASS rank=" << global_rank
+			<< " iteration=" << iteration
+			<< " slots=0 valid=0" << std::endl;
+		return;
+	}
+
+	char* baseline_chunk = nullptr;
+	DuplicateValidationResult* device_result = nullptr;
+	const size_t baseline_chunk_size =
+		CudaRasterizer::required<CudaRasterizer::BinningState>(num_rendered);
+	checkDuplicateValidationCuda(
+		cudaMalloc(reinterpret_cast<void**>(&baseline_chunk), baseline_chunk_size),
+		"allocating baseline binning buffer");
+
+	char* baseline_chunk_cursor = baseline_chunk;
+	CudaRasterizer::BinningState baseline =
+		CudaRasterizer::BinningState::fromChunk(baseline_chunk_cursor, num_rendered);
+	checkDuplicateValidationCuda(
+		cudaMalloc(reinterpret_cast<void**>(&device_result), sizeof(DuplicateValidationResult)),
+		"allocating validation result");
+
+	duplicateWithKeys<<<
+		(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE,
+		ONE_DIM_BLOCK_SIZE>>>(
+		P, points_xy, conic_opacity, depths, offsets,
+		baseline.point_list_keys_unsorted, baseline.point_list_unsorted,
+		radii, compute_locally, grid);
+	checkDuplicateValidationCuda(cudaGetLastError(), "launching baseline duplicateWithKeys");
+
+	checkDuplicateValidationCuda(
+		cub::DeviceRadixSort::SortPairs(
+			baseline.list_sorting_space,
+			baseline.sorting_size,
+			baseline.point_list_keys_unsorted,
+			baseline.point_list_keys,
+			baseline.point_list_unsorted,
+			baseline.point_list,
+			num_rendered,
+			0,
+			sort_end_bit),
+		"sorting baseline duplicate output");
+
+	DuplicateValidationResult host_result = {};
+	const unsigned long long no_mismatch = ~0ull;
+	host_result.first_unsorted_key_mismatch = no_mismatch;
+	host_result.first_unsorted_value_mismatch = no_mismatch;
+	host_result.first_sorted_key_mismatch = no_mismatch;
+	host_result.first_sorted_value_mismatch = no_mismatch;
+	checkDuplicateValidationCuda(
+		cudaMemcpy(
+			device_result,
+			&host_result,
+			sizeof(DuplicateValidationResult),
+			cudaMemcpyHostToDevice),
+		"initializing validation result");
+
+	compareDuplicateOutputs<<<
+		(num_rendered + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE,
+		ONE_DIM_BLOCK_SIZE>>>(
+		num_rendered,
+		baseline.point_list_keys_unsorted,
+		baseline.point_list_unsorted,
+		baseline.point_list_keys,
+		baseline.point_list,
+		candidate.point_list_keys_unsorted,
+		candidate.point_list_unsorted,
+		candidate.point_list_keys,
+		candidate.point_list,
+		device_result);
+	checkDuplicateValidationCuda(cudaGetLastError(), "launching duplicate output comparison");
+	checkDuplicateValidationCuda(
+		cudaMemcpy(
+			&host_result,
+			device_result,
+			sizeof(DuplicateValidationResult),
+			cudaMemcpyDeviceToHost),
+		"copying validation result");
+
+	checkDuplicateValidationCuda(cudaFree(device_result), "freeing validation result");
+	checkDuplicateValidationCuda(cudaFree(baseline_chunk), "freeing baseline binning buffer");
+
+	const bool passed =
+		host_result.baseline_valid_count == host_result.candidate_valid_count &&
+		host_result.baseline_malformed_count == 0 &&
+		host_result.candidate_malformed_count == 0 &&
+		host_result.unsorted_key_mismatches == 0 &&
+		host_result.unsorted_value_mismatches == 0 &&
+		host_result.sorted_key_mismatches == 0 &&
+		host_result.sorted_value_mismatches == 0;
+
+	std::ostringstream summary;
+	summary << "DGR_DUPLICATE_VALIDATE " << (passed ? "PASS" : "FAIL")
+		<< " rank=" << global_rank
+		<< " iteration=" << iteration
+		<< " slots=" << num_rendered
+		<< " baseline_valid=" << host_result.baseline_valid_count
+		<< " candidate_valid=" << host_result.candidate_valid_count
+		<< " baseline_malformed=" << host_result.baseline_malformed_count
+		<< " candidate_malformed=" << host_result.candidate_malformed_count
+		<< " unsorted_key_mismatches=" << host_result.unsorted_key_mismatches
+		<< " unsorted_value_mismatches=" << host_result.unsorted_value_mismatches
+		<< " sorted_key_mismatches=" << host_result.sorted_key_mismatches
+		<< " sorted_value_mismatches=" << host_result.sorted_value_mismatches;
+	if (!passed)
+	{
+		summary << " first_unsorted_key=" << host_result.first_unsorted_key_mismatch
+			<< " first_unsorted_value=" << host_result.first_unsorted_value_mismatch
+			<< " first_sorted_key=" << host_result.first_sorted_key_mismatch
+			<< " first_sorted_value=" << host_result.first_sorted_value_mismatch;
+	}
+
+	std::cout << summary.str() << std::endl;
+	if (!passed)
+		throw std::runtime_error(summary.str());
 }
 
 CudaRasterizer::DistributedState CudaRasterizer::DistributedState::fromChunk(char*& chunk, size_t tile_num, bool sep_rendering=false)
@@ -712,6 +1226,7 @@ int CudaRasterizer::Rasterizer::renderForward(
 	const pybind11::dict &args)
 {
 	auto [global_rank, world_size, iteration, log_interval, device, zhx_debug, zhx_time, mode, dist_division_mode, log_folder] = prepareArgs(args);	
+	const DuplicateConfig duplicate_config = getDuplicateConfig(args);
 	char* log_tmp = new char[500];
 
 	MyTimerOnGPU timer;
@@ -758,7 +1273,7 @@ int CudaRasterizer::Rasterizer::renderForward(
 	timer.start("40 duplicateWithKeys");
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
-	duplicateWithKeys << <(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >> > (
+	CHECK_CUDA(launchDuplicateWithKeys(
 		P,
 		means2D,
 		conic_opacity,
@@ -768,8 +1283,8 @@ int CudaRasterizer::Rasterizer::renderForward(
 		binningState.point_list_unsorted,
 		radii,
 		compute_locally,
-		tile_grid)
-	CHECK_CUDA(, debug)
+		tile_grid,
+		duplicate_config), debug)
 	timer.stop("40 duplicateWithKeys");
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
@@ -783,6 +1298,22 @@ int CudaRasterizer::Rasterizer::renderForward(
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
 	timer.stop("50 SortPairs");
+
+	validateDuplicateOutputs(
+		P,
+		means2D,
+		conic_opacity,
+		depths,
+		geomState.point_offsets,
+		radii,
+		compute_locally,
+		tile_grid,
+		num_rendered,
+		32 + bit,
+		binningState,
+		global_rank,
+		iteration,
+		duplicate_config);
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
@@ -912,7 +1443,14 @@ int CudaRasterizer::Rasterizer::renderForward(
 		timer.stop("83 sum_n_contrib");
 	}
 
-	float forward_render_time = timer.elapsedMilliseconds("70 render", "sum") + timer.elapsedMilliseconds("50 SortPairs", "sum") + timer.elapsedMilliseconds("40 duplicateWithKeys", "sum");
+	float duplicate_with_keys_time = timer.elapsedMilliseconds("40 duplicateWithKeys", "sum");
+	float sort_pairs_time = timer.elapsedMilliseconds("50 SortPairs", "sum");
+	float forward_render_kernel_time = timer.elapsedMilliseconds("70 render", "sum");
+	float forward_render_time =
+		forward_render_kernel_time + sort_pairs_time + duplicate_with_keys_time;
+	args["stats_collector"]["duplicate_with_keys_time"] = duplicate_with_keys_time;
+	args["stats_collector"]["sort_pairs_time"] = sort_pairs_time;
+	args["stats_collector"]["forward_render_kernel_time"] = forward_render_kernel_time;
 	args["stats_collector"]["forward_render_time"] = forward_render_time;
 
 	//////////////////////////// Logging && Save Statictis ////////////////////////////////////////////
@@ -1047,6 +1585,7 @@ static int renderForwardL1Impl(
 	const pybind11::dict &args)
 {
 	auto [global_rank, world_size, iteration, log_interval, device, zhx_debug, zhx_time, mode, dist_division_mode, log_folder] = prepareArgs(args);
+	const DuplicateConfig duplicate_config = getDuplicateConfig(args);
 
 	MyTimerOnGPU timer;
 
@@ -1096,7 +1635,7 @@ static int renderForwardL1Impl(
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
 	timer.start("40 duplicateWithKeys");
-	duplicateWithKeys << <(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >> > (
+	CHECK_CUDA(launchDuplicateWithKeys(
 		P,
 		means2D,
 		conic_opacity,
@@ -1106,8 +1645,8 @@ static int renderForwardL1Impl(
 		binningState.point_list_unsorted,
 		radii,
 		render_compute_locally,
-		tile_grid)
-	CHECK_CUDA(, debug)
+		tile_grid,
+		duplicate_config), debug)
 	timer.stop("40 duplicateWithKeys");
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
@@ -1120,6 +1659,22 @@ static int renderForwardL1Impl(
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
 	timer.stop("50 SortPairs");
+
+	validateDuplicateOutputs(
+		P,
+		means2D,
+		conic_opacity,
+		depths,
+		geomState.point_offsets,
+		radii,
+		render_compute_locally,
+		tile_grid,
+		num_rendered,
+		32 + bit,
+		binningState,
+		global_rank,
+		iteration,
+		duplicate_config);
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
@@ -1220,7 +1775,14 @@ static int renderForwardL1Impl(
 		timer.stop("83 sum_n_contrib");
 	}
 
-	float forward_render_time = timer.elapsedMilliseconds("70 render_l1", "sum") + timer.elapsedMilliseconds("50 SortPairs", "sum") + timer.elapsedMilliseconds("40 duplicateWithKeys", "sum");
+	float duplicate_with_keys_time = timer.elapsedMilliseconds("40 duplicateWithKeys", "sum");
+	float sort_pairs_time = timer.elapsedMilliseconds("50 SortPairs", "sum");
+	float forward_render_kernel_time = timer.elapsedMilliseconds("70 render_l1", "sum");
+	float forward_render_time =
+		forward_render_kernel_time + sort_pairs_time + duplicate_with_keys_time;
+	args["stats_collector"]["duplicate_with_keys_time"] = duplicate_with_keys_time;
+	args["stats_collector"]["sort_pairs_time"] = sort_pairs_time;
+	args["stats_collector"]["forward_render_kernel_time"] = forward_render_kernel_time;
 	args["stats_collector"]["forward_render_time"] = forward_render_time;
 	args["stats_collector"]["forward_loss_time"] = 0.0f;
 	if (fuse_per_gaussian_backward)

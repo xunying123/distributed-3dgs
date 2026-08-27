@@ -81,6 +81,13 @@ class AuxiliaryParams(ParamGroup):
         self.llffhold = 8
         self.backend = "default" # "default", "gsplat"
         self.backward_backend = "per_gaussian"  # "per_gaussian", "per_pixel", "fused_per_gaussian"
+        self.duplicate_backend = "baseline"  # "baseline", "warp_cohort"
+        self.duplicate_warp_threshold = 32
+        self.duplicate_warp_candidate_threshold = 128
+        self.duplicate_validate = False
+        self.duplicate_validate_start_iteration = 0
+        self.duplicate_validate_end_iteration = 0
+        self.duplicate_validate_max_calls = 1
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -337,6 +344,41 @@ def init_args(args):
             "--backward_backend must be 'per_gaussian', 'per_pixel', or "
             "'fused_per_gaussian'"
         )
+
+    args.duplicate_backend = args.duplicate_backend.strip().lower()
+    if args.duplicate_backend not in ("baseline", "warp_cohort"):
+        raise ValueError(
+            "--duplicate_backend must be 'baseline' or 'warp_cohort'"
+        )
+    if args.duplicate_warp_threshold <= 0:
+        raise ValueError("--duplicate_warp_threshold must be positive")
+    if args.duplicate_warp_candidate_threshold <= 0:
+        raise ValueError(
+            "--duplicate_warp_candidate_threshold must be positive"
+        )
+    if args.duplicate_validate and args.duplicate_backend != "warp_cohort":
+        raise ValueError(
+            "--duplicate_validate requires --duplicate_backend warp_cohort"
+        )
+    if args.duplicate_validate_start_iteration < 0:
+        raise ValueError(
+            "--duplicate_validate_start_iteration must be non-negative"
+        )
+    if args.duplicate_validate_end_iteration < 0:
+        raise ValueError(
+            "--duplicate_validate_end_iteration must be non-negative"
+        )
+    if (
+        args.duplicate_validate_end_iteration > 0
+        and args.duplicate_validate_end_iteration
+        < args.duplicate_validate_start_iteration
+    ):
+        raise ValueError(
+            "--duplicate_validate_end_iteration must be zero or greater than "
+            "or equal to --duplicate_validate_start_iteration"
+        )
+    if args.duplicate_validate_max_calls <= 0:
+        raise ValueError("--duplicate_validate_max_calls must be positive")
 
     args.mini_splatting_imp_metric = args.mini_splatting_imp_metric.strip().lower()
     if args.mini_splatting_diagnostic_only:

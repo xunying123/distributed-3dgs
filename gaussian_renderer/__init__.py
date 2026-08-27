@@ -99,6 +99,17 @@ def get_cuda_args(strategy, mode="train"):  # "test"
         "dist_global_strategy": strategy.get_global_strategy_str(),
         "avoid_pixel_all2all": avoid_pixel_all2all,
         "backward_backend": args.backward_backend,
+        "duplicate_backend": args.duplicate_backend,
+        "duplicate_warp_threshold": args.duplicate_warp_threshold,
+        "duplicate_warp_candidate_threshold": (
+            args.duplicate_warp_candidate_threshold
+        ),
+        "duplicate_validate": args.duplicate_validate,
+        "duplicate_validate_start_iteration": (
+            args.duplicate_validate_start_iteration
+        ),
+        "duplicate_validate_end_iteration": args.duplicate_validate_end_iteration,
+        "duplicate_validate_max_calls": args.duplicate_validate_max_calls,
         "stats_collector": {},
     }
     return cuda_args
@@ -600,6 +611,17 @@ def get_cuda_args_final(strategy, mode="train"):
         "zhx_time": str(args.zhx_time),
         "avoid_pixel_all2all": False,
         "backward_backend": args.backward_backend,
+        "duplicate_backend": args.duplicate_backend,
+        "duplicate_warp_threshold": args.duplicate_warp_threshold,
+        "duplicate_warp_candidate_threshold": (
+            args.duplicate_warp_candidate_threshold
+        ),
+        "duplicate_validate": args.duplicate_validate,
+        "duplicate_validate_start_iteration": (
+            args.duplicate_validate_start_iteration
+        ),
+        "duplicate_validate_end_iteration": args.duplicate_validate_end_iteration,
+        "duplicate_validate_max_calls": args.duplicate_validate_max_calls,
         "collect_blur_stats": collect_blur_stats,
         "stats_collector": {},
     }
