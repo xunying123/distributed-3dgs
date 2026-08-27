@@ -69,6 +69,11 @@ class AuxiliaryParams(ParamGroup):
         self.save_iterations = [7_000, 30_000]
         self.quiet = False
         self.checkpoint_iterations = []
+        self.disable_final_save = False
+        self.skip_train_eval = False
+        self.benchmark_from_iteration = -1
+        self.benchmark_until_iteration = -1
+        self.resume_xyz_lr_scale = -1.0
         self.start_checkpoint = ""
         self.auto_start_checkpoint = False
         self.log_folder = "/tmp/gaussian_splatting"
@@ -142,9 +147,20 @@ class OptimizationParams(ParamGroup):
         self.mini_splatting_second_keep_mass = 0.99
         self.mini_splatting_imp_metric = "outdoor"
         self.mini_splatting_seed = 0
+        self.mini_splatting_secondary_weight = 0.0
+        self.mini_splatting_log_contribution_stats = False
+        self.mini_splatting_diagnostic_only = False
+        self.mini_splatting_skip_sample_reinitialization = False
+        self.mini_splatting_preserve_primary = False
+        self.mini_splatting_preserve_optimizer_state = False
+        self.mini_splatting_post_prune_lr_scale = 1.0
         self.mini_splatting_tile_budget = 0
         self.mini_splatting_tile_prune_max_rounds = 3
         self.mini_splatting_tile_prune_max_fraction = 0.1
+        self.mini_splatting_tile_pressure_exponent = 1.0
+        self.mini_splatting_tile_touch_exponent = 0.0
+        self.mini_splatting_tile_primary_penalty = 1.0
+        self.mini_splatting_tile_preserve_primary = False
         self.mini_splatting_blur_threshold = 2e-4
         self.mini_splatting_depth_reinitialization_interval = 5000
         self.mini_splatting_num_depth = 3_500_000
@@ -294,6 +310,23 @@ def find_latest_checkpoint(log_folder):
 
 def init_args(args):
 
+    if args.benchmark_from_iteration < -1:
+        raise ValueError("--benchmark_from_iteration must be -1 or non-negative")
+    if args.benchmark_until_iteration < -1:
+        raise ValueError("--benchmark_until_iteration must be -1 or non-negative")
+    if args.benchmark_until_iteration >= 0:
+        if args.benchmark_from_iteration < 0:
+            raise ValueError(
+                "--benchmark_until_iteration requires --benchmark_from_iteration"
+            )
+        if args.benchmark_until_iteration <= args.benchmark_from_iteration:
+            raise ValueError(
+                "--benchmark_until_iteration must be greater than "
+                "--benchmark_from_iteration"
+            )
+    if args.resume_xyz_lr_scale != -1.0 and not 0.0 < args.resume_xyz_lr_scale <= 1.0:
+        raise ValueError("--resume_xyz_lr_scale must be -1 or in (0, 1]")
+
     args.backward_backend = args.backward_backend.strip().lower()
     if args.backward_backend not in (
         "per_gaussian",
@@ -306,6 +339,8 @@ def init_args(args):
         )
 
     args.mini_splatting_imp_metric = args.mini_splatting_imp_metric.strip().lower()
+    if args.mini_splatting_diagnostic_only:
+        args.mini_splatting_enable_simplification = True
     if args.mini_splatting_tile_budget > 0:
         args.mini_splatting_enable_simplification = True
     mini_splatting_module_flags = (
@@ -345,10 +380,17 @@ def init_args(args):
             raise ValueError("--mini_splatting_second_keep_mass must be in (0, 1]")
         if args.mini_splatting_tile_budget < 0:
             raise ValueError("--mini_splatting_tile_budget must be non-negative")
-        if args.mini_splatting_tile_budget > utils.BLOCK_X * utils.BLOCK_Y:
+        if args.mini_splatting_secondary_weight < 0.0:
             raise ValueError(
-                "--mini_splatting_tile_budget cannot exceed the rasterizer "
-                "block capacity ({})".format(utils.BLOCK_X * utils.BLOCK_Y)
+                "--mini_splatting_secondary_weight must be non-negative"
+            )
+        if (
+            args.mini_splatting_secondary_weight > 0.0
+            and args.mini_splatting_imp_metric != "outdoor"
+        ):
+            raise ValueError(
+                "--mini_splatting_secondary_weight currently requires "
+                "--mini_splatting_imp_metric outdoor"
             )
         if args.mini_splatting_tile_prune_max_rounds < 0:
             raise ValueError(
@@ -357,6 +399,30 @@ def init_args(args):
         if not 0.0 < args.mini_splatting_tile_prune_max_fraction <= 1.0:
             raise ValueError(
                 "--mini_splatting_tile_prune_max_fraction must be in (0, 1]"
+            )
+        if not 0.0 <= args.mini_splatting_tile_pressure_exponent <= 1.0:
+            raise ValueError(
+                "--mini_splatting_tile_pressure_exponent must be in [0, 1]"
+            )
+        if not 0.0 <= args.mini_splatting_tile_touch_exponent <= 1.0:
+            raise ValueError(
+                "--mini_splatting_tile_touch_exponent must be in [0, 1]"
+            )
+        if args.mini_splatting_tile_primary_penalty < 1.0:
+            raise ValueError(
+                "--mini_splatting_tile_primary_penalty must be at least 1"
+            )
+        if (
+            args.mini_splatting_preserve_optimizer_state
+            and not args.mini_splatting_skip_sample_reinitialization
+        ):
+            raise ValueError(
+                "--mini_splatting_preserve_optimizer_state requires "
+                "--mini_splatting_skip_sample_reinitialization"
+            )
+        if not 0.0 < args.mini_splatting_post_prune_lr_scale <= 1.0:
+            raise ValueError(
+                "--mini_splatting_post_prune_lr_scale must be in (0, 1]"
             )
         if args.mini_splatting_imp_metric not in ("outdoor", "indoor"):
             raise ValueError(
@@ -408,7 +474,11 @@ def init_args(args):
     # sort test_iterations
     args.test_iterations.sort()
     args.save_iterations.sort()
-    if len(args.save_iterations) > 0 and args.iterations not in args.save_iterations:
+    if (
+        not args.disable_final_save
+        and len(args.save_iterations) > 0
+        and args.iterations not in args.save_iterations
+    ):
         args.save_iterations.append(args.iterations)
     args.checkpoint_iterations.sort()
 

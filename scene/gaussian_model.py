@@ -67,6 +67,7 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.post_prune_xyz_lr_scale = 1.0
         self.setup_functions()
 
     def capture(self):
@@ -83,9 +84,15 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.post_prune_xyz_lr_scale,
         )
 
     def restore(self, model_args, training_args):
+        # Checkpoints written before post-prune LR persistence contain 12
+        # fields. Keep them loadable and let the caller explicitly override
+        # the scale when resuming a pruned legacy checkpoint.
+        if len(model_args) == 12:
+            model_args = (*model_args, 1.0)
         (
             self.active_sh_degree,
             self._xyz,
@@ -99,6 +106,7 @@ class GaussianModel:
             denom,
             opt_dict,
             self.spatial_lr_scale,
+            self.post_prune_xyz_lr_scale,
         ) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = (
@@ -407,7 +415,10 @@ class GaussianModel:
         """Learning rate scheduling per step"""
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
+                lr = (
+                    self.xyz_scheduler_args(iteration)
+                    * self.post_prune_xyz_lr_scale
+                )
                 param_group["lr"] = lr
                 return lr
 

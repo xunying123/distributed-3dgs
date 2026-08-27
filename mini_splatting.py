@@ -1,5 +1,7 @@
 """Distributed implementation of Mini-Splatting's simplification stages."""
 
+import time
+
 import torch
 import torch.distributed as dist
 
@@ -77,6 +79,9 @@ def _route_stats_to_owners(
     overload_pressure,
     overloaded_touches,
     metric,
+    accum_weights=None,
+    projected_area=None,
+    secondary_importance=None,
 ):
     group = utils.DEFAULT_GROUP
     rank = group.rank()
@@ -135,13 +140,138 @@ def _route_stats_to_owners(
 
     view_has_max = owner_stats[:, 2] != 0
     area_max.add_(owner_stats[:, 2])
+    if accum_weights is not None:
+        accum_weights.add_(owner_stats[:, 0])
+    if projected_area is not None:
+        projected_area.add_(owner_stats[:, 1])
     if metric == "outdoor":
         valid = torch.logical_and(view_has_max, owner_stats[:, 1] != 0)
         importance[valid] += owner_stats[valid, 0] / owner_stats[valid, 1]
     else:
         importance.add_(owner_stats[:, 0])
+    if secondary_importance is not None:
+        secondary_valid = torch.logical_and(
+            ~view_has_max, owner_stats[:, 1] != 0
+        )
+        secondary_importance[secondary_valid] += (
+            owner_stats[secondary_valid, 0] / owner_stats[secondary_valid, 1]
+        )
     overload_pressure.add_(owner_stats[:, 3])
     overloaded_touches.add_(owner_stats[:, 4])
+
+
+def _log_contribution_stats(
+    iteration,
+    tile_budget,
+    gaussians,
+    importance,
+    accum_weights,
+    projected_area,
+    area_max,
+    overload_pressure,
+    overloaded_touches,
+    secondary_importance,
+):
+    """Log global primary/secondary/invisible contribution diagnostics."""
+    primary = area_max > 0
+    secondary = torch.logical_and(~primary, accum_weights > 0)
+    invisible = torch.logical_not(torch.logical_or(primary, secondary))
+    classes = (
+        ("primary", primary),
+        ("secondary", secondary),
+        ("invisible", invisible),
+    )
+
+    opacity = gaussians.get_opacity.detach().flatten()
+    mean_scale = gaussians.get_scaling.detach().mean(dim=1)
+    xyz = gaussians.get_xyz.detach()
+    counts = torch.tensor(
+        [int(mask.sum().item()) for _, mask in classes],
+        dtype=torch.long,
+        device="cuda",
+    )
+    hotspot = torch.logical_and(overload_pressure > 0, overloaded_touches > 0)
+    hotspot_counts = torch.tensor(
+        [int(torch.logical_and(mask, hotspot).sum().item()) for _, mask in classes],
+        dtype=torch.long,
+        device="cuda",
+    )
+    sums = torch.zeros((3, 9), dtype=torch.float64, device="cuda")
+    opacity_min = torch.full((3,), float("inf"), dtype=torch.float64, device="cuda")
+    opacity_max = torch.full((3,), float("-inf"), dtype=torch.float64, device="cuda")
+    xyz_min = torch.full((3, 3), float("inf"), dtype=torch.float64, device="cuda")
+    xyz_max = torch.full((3, 3), float("-inf"), dtype=torch.float64, device="cuda")
+    for class_id, (_, mask) in enumerate(classes):
+        if not mask.any():
+            continue
+        sums[class_id, 0] = accum_weights[mask].double().sum()
+        sums[class_id, 1] = projected_area[mask].double().sum()
+        sums[class_id, 2] = area_max[mask].double().sum()
+        sums[class_id, 3] = importance[mask].double().sum()
+        sums[class_id, 4] = overload_pressure[mask].double().sum()
+        sums[class_id, 5] = overloaded_touches[mask].double().sum()
+        sums[class_id, 6] = opacity[mask].double().sum()
+        sums[class_id, 7] = mean_scale[mask].double().sum()
+        sums[class_id, 8] = secondary_importance[mask].double().sum()
+        opacity_min[class_id] = opacity[mask].double().min()
+        opacity_max[class_id] = opacity[mask].double().max()
+        xyz_values = xyz[mask].double()
+        xyz_min[class_id] = xyz_values.amin(dim=0)
+        xyz_max[class_id] = xyz_values.amax(dim=0)
+
+    group = utils.DEFAULT_GROUP
+    if group.size() > 1:
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
+        dist.all_reduce(hotspot_counts, op=dist.ReduceOp.SUM, group=group)
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM, group=group)
+        dist.all_reduce(opacity_min, op=dist.ReduceOp.MIN, group=group)
+        dist.all_reduce(opacity_max, op=dist.ReduceOp.MAX, group=group)
+        dist.all_reduce(xyz_min, op=dist.ReduceOp.MIN, group=group)
+        dist.all_reduce(xyz_max, op=dist.ReduceOp.MAX, group=group)
+
+    total = int(counts.sum().item())
+    lines = [
+        "Mini-Splatting contribution stats at iteration {} tile_budget={}: total={}".format(
+            iteration, tile_budget, total
+        )
+    ]
+    for class_id, (name, _) in enumerate(classes):
+        count = int(counts[class_id].item())
+        denominator = max(count, 1)
+        bbox_min = xyz_min[class_id].cpu().tolist() if count else [0.0] * 3
+        bbox_max = xyz_max[class_id].cpu().tolist() if count else [0.0] * 3
+        lines.append(
+            "  {}: count={} ratio={:.4f}% accum_weight={:.6e} "
+            "projected_area={:.0f} max_area={:.0f} importance={:.6e} "
+            "secondary_score={:.6e} "
+            "pressure={:.6e} touches={:.0f} hotspot_count={} "
+            "hotspot_ratio={:.4f}% mean_opacity={:.6e} "
+            "mean_scale={:.6e} opacity_range=[{:.6e},{:.6e}] "
+            "xyz_bbox_min={} xyz_bbox_max={}".format(
+                name,
+                count,
+                100.0 * count / max(total, 1),
+                sums[class_id, 0].item(),
+                sums[class_id, 1].item(),
+                sums[class_id, 2].item(),
+                sums[class_id, 3].item(),
+                sums[class_id, 8].item(),
+                sums[class_id, 4].item(),
+                sums[class_id, 5].item(),
+                hotspot_counts[class_id].item(),
+                100.0 * hotspot_counts[class_id].item() / denominator,
+                sums[class_id, 6].item() / denominator,
+                sums[class_id, 7].item() / denominator,
+                opacity_min[class_id].item() if count else 0.0,
+                opacity_max[class_id].item() if count else 0.0,
+                [round(value, 6) for value in bbox_min],
+                [round(value, 6) for value in bbox_max],
+            )
+        )
+    message = "\n".join(lines) + "\n"
+    utils.get_log_file().write(message)
+    utils.get_log_file().flush()
+    utils.print_rank_0(message.rstrip())
 
 
 def _collect_importance(
@@ -154,10 +284,22 @@ def _collect_importance(
     tile_budget=0,
 ):
     args = utils.get_args()
+    torch.cuda.synchronize()
+    started_at = time.perf_counter()
     importance = torch.zeros(gaussians.get_xyz.shape[0], device="cuda")
     area_max = torch.zeros_like(importance)
     overload_pressure = torch.zeros_like(importance)
     overloaded_touches = torch.zeros_like(importance)
+    collect_contribution_stats = args.mini_splatting_log_contribution_stats
+    collect_secondary = (
+        collect_contribution_stats
+        or args.mini_splatting_secondary_weight > 0.0
+    )
+    accum_weights = torch.zeros_like(importance) if collect_contribution_stats else None
+    projected_area = torch.zeros_like(importance) if collect_contribution_stats else None
+    secondary_importance = (
+        torch.zeros_like(importance) if collect_secondary else None
+    )
     local_tile_occupancies = []
 
     for camera in train_dataset.cameras:
@@ -184,6 +326,9 @@ def _collect_importance(
             overload_pressure,
             overloaded_touches,
             args.mini_splatting_imp_metric,
+            accum_weights,
+            projected_area,
+            secondary_importance,
         )
         if tile_budget > 0 and n_render.numel() > 0:
             compute_locally = strategies[0].get_compute_locally()
@@ -207,7 +352,35 @@ def _collect_importance(
             screenspace_pkg,
         )
 
-    importance[area_max == 0] = 0
+    torch.cuda.synchronize()
+    scan_seconds = time.perf_counter() - started_at
+
+    if args.mini_splatting_secondary_weight > 0.0:
+        importance.add_(
+            secondary_importance * args.mini_splatting_secondary_weight
+        )
+    if collect_contribution_stats:
+        _log_contribution_stats(
+            iteration,
+            tile_budget,
+            gaussians,
+            importance,
+            accum_weights,
+            projected_area,
+            area_max,
+            overload_pressure,
+            overloaded_touches,
+            secondary_importance,
+        )
+    if args.mini_splatting_secondary_weight == 0.0:
+        # Preserve the repository's existing primary-contributor compatibility
+        # semantics unless the secondary score is explicitly enabled.
+        importance[area_max == 0] = 0
+    else:
+        invisible = torch.logical_and(
+            area_max == 0, secondary_importance == 0
+        )
+        importance[invisible] = 0
     tile_summary = {
         "total_tiles": 0,
         "active_tiles": 0,
@@ -329,7 +502,51 @@ def _collect_importance(
             "mean_overloaded_occupancy": float(float_values[2]),
             "overloaded_ratio": float(float_values[3]),
         }
-    return importance, overload_pressure, overloaded_touches, tile_summary
+    torch.cuda.synchronize()
+    total_seconds = time.perf_counter() - started_at
+    collection_profile = torch.tensor(
+        [
+            total_seconds,
+            scan_seconds,
+            max(total_seconds - scan_seconds, 0.0),
+            torch.cuda.memory_allocated() / (1024**3),
+            torch.cuda.memory_reserved() / (1024**3),
+        ],
+        dtype=torch.float64,
+        device="cuda",
+    )
+    if utils.DEFAULT_GROUP.size() > 1:
+        dist.all_reduce(
+            collection_profile,
+            op=dist.ReduceOp.MAX,
+            group=utils.DEFAULT_GROUP,
+        )
+    profile_message = (
+        "Mini-Splatting importance collection at iteration {}: views={} "
+        "tile_budget={} max_rank_seconds={:.3f} max_rank_scan_seconds={:.3f} "
+        "max_rank_postprocess_seconds={:.3f} views_per_second={:.3f} "
+        "max_rank_allocated_gib={:.3f} max_rank_reserved_gib={:.3f}\n"
+    ).format(
+        iteration,
+        len(train_dataset.cameras),
+        tile_budget,
+        collection_profile[0].item(),
+        collection_profile[1].item(),
+        collection_profile[2].item(),
+        len(train_dataset.cameras) / max(collection_profile[0].item(), 1e-12),
+        collection_profile[3].item(),
+        collection_profile[4].item(),
+    )
+    utils.get_log_file().write(profile_message)
+    utils.get_log_file().flush()
+    utils.print_rank_0(profile_message.rstrip())
+    return (
+        importance,
+        overload_pressure,
+        overloaded_touches,
+        tile_summary,
+        area_max > 0,
+    )
 
 
 def _weighted_sample_without_replacement(weights, sample_count, generator):
@@ -352,9 +569,18 @@ def _weighted_sample_without_replacement(weights, sample_count, generator):
     return torch.topk(keys, sample_count, largest=False, sorted=False).indices
 
 
-def _source_sampling_mask(local_importance, sampling_factor, seed):
+def _source_sampling_mask(
+    local_importance,
+    local_primary,
+    sampling_factor,
+    seed,
+    preserve_primary,
+):
     counts = _counts(local_importance.numel())
     global_importance = _gather_to_rank0(local_importance, counts)
+    global_primary = None
+    if preserve_primary:
+        global_primary = _gather_to_rank0(local_primary.to(torch.uint8), counts)
     local_mask_template = torch.empty(
         local_importance.shape[0], dtype=torch.uint8, device="cuda"
     )
@@ -362,6 +588,9 @@ def _source_sampling_mask(local_importance, sampling_factor, seed):
     global_mask = None
     sampled_count = 0
     nonzero_count = 0
+    primary_count = 0
+    selected_primary_count = 0
+    selected_secondary_count = 0
     if utils.DEFAULT_GROUP.rank() == 0:
         positive_ids = torch.nonzero(global_importance > 0, as_tuple=False).flatten()
         nonzero_count = int(positive_ids.numel())
@@ -369,24 +598,74 @@ def _source_sampling_mask(local_importance, sampling_factor, seed):
         if sampled_count > 0:
             generator = torch.Generator(device="cuda")
             generator.manual_seed(seed)
-            sampled_ids = _weighted_sample_without_replacement(
-                global_importance[positive_ids],
-                sampled_count,
-                generator=generator,
-            )
-            indices = positive_ids[sampled_ids]
+            if preserve_primary:
+                positive_primary = global_primary[positive_ids].bool()
+                primary_ids = positive_ids[positive_primary]
+                secondary_ids = positive_ids[~positive_primary]
+                primary_count = int(primary_ids.numel())
+                if sampled_count >= primary_count:
+                    selected_primary_ids = primary_ids
+                    secondary_target = sampled_count - primary_count
+                    if secondary_target > 0:
+                        secondary_sampled_ids = (
+                            _weighted_sample_without_replacement(
+                                global_importance[secondary_ids],
+                                secondary_target,
+                                generator=generator,
+                            )
+                        )
+                        selected_secondary_ids = secondary_ids[
+                            secondary_sampled_ids
+                        ]
+                    else:
+                        selected_secondary_ids = secondary_ids[:0]
+                else:
+                    primary_sampled_ids = _weighted_sample_without_replacement(
+                        global_importance[primary_ids],
+                        sampled_count,
+                        generator=generator,
+                    )
+                    selected_primary_ids = primary_ids[primary_sampled_ids]
+                    selected_secondary_ids = secondary_ids[:0]
+                selected_primary_count = int(selected_primary_ids.numel())
+                selected_secondary_count = int(selected_secondary_ids.numel())
+                indices = torch.cat(
+                    (selected_primary_ids, selected_secondary_ids), dim=0
+                )
+            else:
+                sampled_ids = _weighted_sample_without_replacement(
+                    global_importance[positive_ids],
+                    sampled_count,
+                    generator=generator,
+                )
+                indices = positive_ids[sampled_ids]
             global_mask = torch.zeros_like(global_importance, dtype=torch.uint8)
             global_mask[indices] = 1
 
     summary = torch.tensor(
-        [nonzero_count, sampled_count], dtype=torch.long, device="cuda"
+        [
+            nonzero_count,
+            sampled_count,
+            primary_count,
+            selected_primary_count,
+            selected_secondary_count,
+        ],
+        dtype=torch.long,
+        device="cuda",
     )
     if utils.DEFAULT_GROUP.size() > 1:
         dist.broadcast(summary, src=0, group=utils.DEFAULT_GROUP)
     if summary[1].item() <= 0:
         raise RuntimeError("Mini-Splatting sampling selected zero Gaussians")
     local_mask = _scatter_from_rank0(global_mask, counts, local_mask_template)
-    return local_mask.bool(), int(summary[0].item()), int(summary[1].item())
+    return (
+        local_mask.bool(),
+        int(summary[0].item()),
+        int(summary[1].item()),
+        int(summary[2].item()),
+        int(summary[3].item()),
+        int(summary[4].item()),
+    )
 
 
 def _source_cdf_mask(local_importance, keep_mass):
@@ -397,30 +676,77 @@ def _source_cdf_mask(local_importance, keep_mass):
     )
 
     global_mask = None
+    keep_count = 0
+    total_mass = 0.0
+    retained_mass = 0.0
+    threshold = 0.0
     if utils.DEFAULT_GROUP.rank() == 0:
+        nonnegative_importance = torch.clamp_min(global_importance.flatten(), 0)
+        total_mass = float(nonnegative_importance.double().sum().item())
         if keep_mass == 1.0:
             global_mask = torch.ones_like(global_importance, dtype=torch.uint8)
+            keep_count = global_importance.numel()
+            retained_mass = total_mass
+            threshold = float(nonnegative_importance.min().item())
         else:
-            values, _ = torch.sort(global_importance.flatten() + 1e-6)
-            cumulative = torch.cumsum(values, dim=0)
-            split = torch.nonzero(
-                cumulative / values.sum() > (1.0 - keep_mass), as_tuple=False
-            ).min()
-            threshold = values[split]
-            global_mask = (global_importance > threshold).to(torch.uint8)
-    return _scatter_from_rank0(global_mask, counts, local_mask_template).bool()
+            if total_mass <= 0.0:
+                raise RuntimeError(
+                    "Mini-Splatting CDF pruning requires positive importance mass"
+                )
+            values, indices = torch.sort(
+                nonnegative_importance, descending=True
+            )
+            cumulative = torch.cumsum(values.double(), dim=0)
+            target_mass = total_mass * keep_mass
+            keep_count = min(
+                int(torch.searchsorted(cumulative, target_mass).item()) + 1,
+                values.numel(),
+            )
+            selected = indices[:keep_count]
+            global_mask = torch.zeros_like(global_importance, dtype=torch.uint8)
+            global_mask[selected] = 1
+            retained_mass = float(cumulative[keep_count - 1].item())
+            threshold = float(values[keep_count - 1].item())
+
+    summary = torch.tensor(
+        [keep_count, total_mass, retained_mass, threshold],
+        dtype=torch.float64,
+        device="cuda",
+    )
+    if utils.DEFAULT_GROUP.size() > 1:
+        dist.broadcast(summary, src=0, group=utils.DEFAULT_GROUP)
+    local_mask = _scatter_from_rank0(
+        global_mask, counts, local_mask_template
+    ).bool()
+    return (
+        local_mask,
+        int(summary[0].item()),
+        summary[2].item() / max(summary[1].item(), 1e-30),
+        summary[3].item(),
+    )
 
 
 def _tile_budget_mask(
     local_importance,
     local_pressure,
     local_touches,
+    local_primary,
     excess_instances,
     max_prune_fraction,
+    pressure_exponent,
+    touch_exponent,
+    primary_penalty,
+    preserve_primary,
 ):
     counts = _counts(local_importance.numel())
     local_stats = torch.stack(
-        (local_importance, local_pressure, local_touches), dim=1
+        (
+            local_importance,
+            local_pressure,
+            local_touches,
+            local_primary.to(local_importance.dtype),
+        ),
+        dim=1,
     )
     global_stats = _gather_to_rank0(local_stats, counts)
     local_mask_template = torch.empty(
@@ -435,10 +761,14 @@ def _tile_budget_mask(
         importance = global_stats[:, 0]
         pressure = global_stats[:, 1]
         touches = global_stats[:, 2]
-        candidate_ids = torch.nonzero(
-            torch.logical_and(pressure > 0, touches > 0), as_tuple=False
-        ).flatten()
+        candidate_mask = torch.logical_and(pressure > 0, touches > 0)
+        if preserve_primary:
+            candidate_mask.logical_and_(global_stats[:, 3] == 0)
+        candidate_ids = torch.nonzero(candidate_mask, as_tuple=False).flatten()
         candidate_count = int(candidate_ids.numel())
+        global_mask = torch.ones(
+            global_stats.shape[0], dtype=torch.uint8, device="cuda"
+        )
         if candidate_count > 0:
             positive = importance > 0
             if positive.any():
@@ -448,9 +778,15 @@ def _tile_budget_mask(
             relative_importance = importance / torch.clamp_min(
                 importance_scale, 1e-12
             )
-            priority = pressure[candidate_ids] / (
-                relative_importance[candidate_ids] + 1e-6
-            )
+            priority = pressure[candidate_ids].pow(pressure_exponent)
+            if touch_exponent > 0.0:
+                priority.div_(touches[candidate_ids].pow(touch_exponent))
+            priority.div_(relative_importance[candidate_ids] + 1e-6)
+            if primary_penalty > 1.0 and not preserve_primary:
+                candidate_primary = global_stats[candidate_ids, 3] != 0
+                priority[candidate_primary] = (
+                    priority[candidate_primary] / primary_penalty
+                )
             order = torch.argsort(priority, descending=True)
             ordered_ids = candidate_ids[order]
             cumulative_touches = torch.cumsum(touches[ordered_ids], dim=0)
@@ -464,9 +800,6 @@ def _tile_budget_mask(
             selected_count = min(required, max_selected, candidate_count)
             selected_ids = ordered_ids[:selected_count]
             covered_touches = int(touches[selected_ids].sum().item())
-            global_mask = torch.ones(
-                global_stats.shape[0], dtype=torch.uint8, device="cuda"
-            )
             global_mask[selected_ids] = 0
 
     summary = torch.tensor(
@@ -476,10 +809,6 @@ def _tile_budget_mask(
     )
     if utils.DEFAULT_GROUP.size() > 1:
         dist.broadcast(summary, src=0, group=utils.DEFAULT_GROUP)
-    if summary[1].item() <= 0:
-        raise RuntimeError(
-            "Mini-Splatting found overloaded tiles but no removable Gaussians"
-        )
     local_mask = _scatter_from_rank0(global_mask, counts, local_mask_template)
     return (
         local_mask.bool(),
@@ -728,6 +1057,51 @@ def _reset_strategy_history(strategy_history):
         heuristic.fill_(1.0)
 
 
+def _reset_pruning_accumulators(gaussians):
+    """Reset non-optimizer per-Gaussian buffers after a topology change."""
+    point_count = gaussians.get_xyz.shape[0]
+    device = gaussians.get_xyz.device
+    gaussians.xyz_gradient_accum = torch.zeros((point_count, 1), device=device)
+    gaussians.denom = torch.zeros((point_count, 1), device=device)
+    gaussians.max_radii2D = torch.zeros(point_count, device=device)
+    gaussians.sum_visible_count_in_one_batch = torch.zeros(
+        point_count, device=device
+    )
+    gaussians.send_to_gpui_cnt = torch.zeros(
+        (point_count, gaussians.group_for_redistribution().size()),
+        dtype=torch.int,
+        device=device,
+    )
+    gaussians.reset_blur_split_stats()
+
+
+def _set_post_prune_learning_rates(gaussians, opt_args, scale):
+    """Set post-pruning learning rates without compounding across stages."""
+    gaussians.post_prune_xyz_lr_scale = scale
+    if opt_args.lr_scale_mode == "linear":
+        batch_scale = utils.get_args().bsz
+    elif opt_args.lr_scale_mode == "sqrt":
+        batch_scale = utils.get_args().bsz**0.5
+    elif opt_args.lr_scale_mode == "accumu":
+        batch_scale = 1.0
+    else:
+        raise ValueError(
+            "Unsupported lr_scale_mode: {}".format(opt_args.lr_scale_mode)
+        )
+    base_lrs = {
+        "f_dc": opt_args.feature_lr * batch_scale,
+        "f_rest": opt_args.feature_lr / 20.0 * batch_scale,
+        "opacity": opt_args.opacity_lr * batch_scale,
+        "scaling": opt_args.scaling_lr
+        * utils.get_args().lr_scale_pos_and_scale
+        * batch_scale,
+        "rotation": opt_args.rotation_lr * batch_scale,
+    }
+    for group in gaussians.optimizer.param_groups:
+        if group["name"] in base_lrs:
+            group["lr"] = base_lrs[group["name"]] * scale
+
+
 def _enforce_tile_budget(
     iteration,
     stage,
@@ -745,7 +1119,7 @@ def _enforce_tile_budget(
 
     total_removed = 0
     for round_index in range(args.mini_splatting_tile_prune_max_rounds + 1):
-        importance, pressure, touches, summary = _collect_importance(
+        importance, pressure, touches, summary, primary_mask = _collect_importance(
             iteration,
             train_dataset,
             gaussians,
@@ -759,7 +1133,8 @@ def _enforce_tile_budget(
             "budget={} total_tiles={} active={} empty={} "
             "avg_all={:.2f} avg_active={:.2f} "
             "p50={} p90={} p95={} p99={} max={} "
-            "overloaded={}/{} ({:.2f}%) avg_overloaded={:.2f} "
+            "overloaded={}/{} ({:.2f}%) within_budget_all={:.2f}% "
+            "within_budget_active={:.2f}% avg_overloaded={:.2f} "
             "excess={} intersections={}\n"
         ).format(
             stage,
@@ -779,6 +1154,10 @@ def _enforce_tile_budget(
             summary["overloaded_tiles"],
             summary["active_tiles"],
             summary["overloaded_ratio"],
+            100.0
+            * (summary["total_tiles"] - summary["overloaded_tiles"])
+            / max(summary["total_tiles"], 1),
+            100.0 - summary["overloaded_ratio"],
             summary["mean_overloaded_occupancy"],
             summary["excess_instances"],
             summary["intersections"],
@@ -801,20 +1180,98 @@ def _enforce_tile_budget(
             importance,
             pressure,
             touches,
+            primary_mask,
             summary["excess_instances"],
             args.mini_splatting_tile_prune_max_fraction,
+            args.mini_splatting_tile_pressure_exponent,
+            args.mini_splatting_tile_touch_exponent,
+            args.mini_splatting_tile_primary_penalty,
+            args.mini_splatting_tile_preserve_primary,
         )
+        if selected <= 0:
+            warning = (
+                "Mini-Splatting tile budget stopped at round {}: "
+                "no removable candidates (preserve_primary={}).\n"
+            ).format(round_index + 1, args.mini_splatting_tile_preserve_primary)
+            utils.get_log_file().write(warning)
+            utils.print_rank_0(warning.rstrip())
+            return total_removed
         before = _global_count(gaussians.get_xyz.shape[0])
+        selected_local = ~keep
+        selected_primary = torch.logical_and(selected_local, primary_mask)
+        selected_secondary = torch.logical_and(
+            selected_local,
+            torch.logical_and(~primary_mask, importance > 0),
+        )
+        selected_metrics = torch.stack(
+            (
+                selected_local.double().sum(),
+                torch.logical_and(selected_local, importance == 0).double().sum(),
+                selected_primary.double().sum(),
+                selected_secondary.double().sum(),
+                importance[selected_local].double().sum(),
+                pressure[selected_local].double().sum(),
+                touches[selected_local].double().sum(),
+                gaussians.get_opacity[selected_local].double().sum(),
+                gaussians.get_scaling[selected_local]
+                .max(dim=1)
+                .values.double()
+                .sum(),
+            )
+        )
+        if utils.DEFAULT_GROUP.size() > 1:
+            dist.all_reduce(
+                selected_metrics,
+                op=dist.ReduceOp.SUM,
+                group=utils.DEFAULT_GROUP,
+            )
+        selected_denominator = max(selected_metrics[0].item(), 1.0)
+        torch.cuda.synchronize()
+        prune_started_at = time.perf_counter()
         gaussians.prune_points(~keep)
-        gaussians.training_setup(opt_args)
+        torch.cuda.synchronize()
+        prune_seconds = time.perf_counter() - prune_started_at
+        optimizer_started_at = time.perf_counter()
+        if args.mini_splatting_preserve_optimizer_state:
+            _reset_pruning_accumulators(gaussians)
+        else:
+            gaussians.training_setup(opt_args)
+        torch.cuda.synchronize()
+        optimizer_rebuild_seconds = time.perf_counter() - optimizer_started_at
+        redistribute_started_at = time.perf_counter()
         gaussians.redistribute_gaussians()
+        torch.cuda.synchronize()
+        redistribute_seconds = time.perf_counter() - redistribute_started_at
         gaussians.reset_blur_split_stats()
         _reset_strategy_history(strategy_history)
         after = _global_count(gaussians.get_xyz.shape[0])
         total_removed += before - after
+        round_profile = torch.tensor(
+            [prune_seconds, optimizer_rebuild_seconds, redistribute_seconds],
+            dtype=torch.float64,
+            device="cuda",
+        )
+        if utils.DEFAULT_GROUP.size() > 1:
+            dist.all_reduce(
+                round_profile,
+                op=dist.ReduceOp.MAX,
+                group=utils.DEFAULT_GROUP,
+            )
+        prune_seconds, optimizer_rebuild_seconds, redistribute_seconds = (
+            round_profile.cpu().tolist()
+        )
         prune_message = (
             "Mini-Splatting tile prune after {} at iteration {} round {}: "
-            "before={} after={} candidates={} selected={} covered_touches={}\n"
+            "before={} after={} candidates={} selected={} covered_touches={} "
+            "pressure_exponent={:.3f} touch_exponent={:.3f} "
+            "primary_penalty={:.3f} preserve_primary={} "
+            "selected_primary={} selected_secondary={} "
+            "selected_zero_importance={} "
+            "selected_importance_mean={:.6e} selected_pressure_mean={:.6e} "
+            "selected_touches_mean={:.3f} selected_opacity_mean={:.6e} "
+            "selected_scale_mean={:.6e} "
+            "prune_seconds={:.3f} optimizer_rebuild_seconds={:.3f} "
+            "redistribute_seconds={:.3f} preserve_optimizer_state={}\n"
         ).format(
             stage,
             iteration,
@@ -824,6 +1281,22 @@ def _enforce_tile_budget(
             candidates,
             selected,
             covered_touches,
+            args.mini_splatting_tile_pressure_exponent,
+            args.mini_splatting_tile_touch_exponent,
+            args.mini_splatting_tile_primary_penalty,
+            args.mini_splatting_tile_preserve_primary,
+            int(selected_metrics[2].item()),
+            int(selected_metrics[3].item()),
+            int(selected_metrics[1].item()),
+            selected_metrics[4].item() / selected_denominator,
+            selected_metrics[5].item() / selected_denominator,
+            selected_metrics[6].item() / selected_denominator,
+            selected_metrics[7].item() / selected_denominator,
+            selected_metrics[8].item() / selected_denominator,
+            prune_seconds,
+            optimizer_rebuild_seconds,
+            redistribute_seconds,
+            args.mini_splatting_preserve_optimizer_state,
         )
         utils.get_log_file().write(prune_message)
         utils.print_rank_0(prune_message.rstrip())
@@ -844,36 +1317,135 @@ def run_mini_splatting_pruning(
 ):
     args = utils.get_args()
     before = _global_count(gaussians.get_xyz.shape[0])
-    importance, _, _, _ = _collect_importance(
+    diagnostic_tile_budget = (
+        args.mini_splatting_tile_budget
+        if args.mini_splatting_diagnostic_only
+        else 0
+    )
+    (
+        importance,
+        pressure,
+        touches,
+        diagnostic_tile_summary,
+        primary_mask,
+    ) = _collect_importance(
         iteration,
         train_dataset,
         gaussians,
         pipe_args,
         background,
         strategy_history,
+        tile_budget=diagnostic_tile_budget,
     )
 
+    if args.mini_splatting_diagnostic_only:
+        overload_totals = torch.stack(
+            (pressure.double().sum(), touches.double().sum())
+        )
+        if utils.DEFAULT_GROUP.size() > 1:
+            dist.all_reduce(
+                overload_totals,
+                op=dist.ReduceOp.SUM,
+                group=utils.DEFAULT_GROUP,
+            )
+        message = (
+            "Mini-Splatting diagnostic-only at iteration {}: views={} "
+            "gaussians={} tile_budget={} total_tiles={} active={} empty={} "
+            "avg_all={:.2f} avg_active={:.2f} p50={} p90={} p95={} p99={} "
+            "max={} overloaded={} overloaded_ratio={:.2f}% "
+            "within_budget_all={:.2f}% within_budget_active={:.2f}% "
+            "mean_overloaded={:.2f} excess={} intersections={} "
+            "pressure_sum={:.6e} touches_sum={:.0f}\n"
+        ).format(
+            iteration,
+            len(train_dataset.cameras),
+            before,
+            diagnostic_tile_budget,
+            diagnostic_tile_summary["total_tiles"],
+            diagnostic_tile_summary["active_tiles"],
+            diagnostic_tile_summary["empty_tiles"],
+            diagnostic_tile_summary["mean_occupancy"],
+            diagnostic_tile_summary["mean_active_occupancy"],
+            diagnostic_tile_summary["p50_occupancy"],
+            diagnostic_tile_summary["p90_occupancy"],
+            diagnostic_tile_summary["p95_occupancy"],
+            diagnostic_tile_summary["p99_occupancy"],
+            diagnostic_tile_summary["max_occupancy"],
+            diagnostic_tile_summary["overloaded_tiles"],
+            diagnostic_tile_summary["overloaded_ratio"],
+            100.0
+            * (
+                diagnostic_tile_summary["total_tiles"]
+                - diagnostic_tile_summary["overloaded_tiles"]
+            )
+            / max(diagnostic_tile_summary["total_tiles"], 1),
+            100.0 - diagnostic_tile_summary["overloaded_ratio"],
+            diagnostic_tile_summary["mean_overloaded_occupancy"],
+            diagnostic_tile_summary["excess_instances"],
+            diagnostic_tile_summary["intersections"],
+            overload_totals[0].item(),
+            overload_totals[1].item(),
+        )
+        utils.get_log_file().write(message)
+        utils.get_log_file().flush()
+        utils.print_rank_0(message.rstrip())
+        torch.cuda.empty_cache()
+        return 0
+
     if stage == "sample":
-        keep, nonzero_count, target = _source_sampling_mask(
+        (
+            keep,
+            nonzero_count,
+            target,
+            primary_count,
+            selected_primary,
+            selected_secondary,
+        ) = _source_sampling_mask(
             importance,
+            primary_mask,
             args.mini_splatting_sampling_factor,
             args.mini_splatting_seed,
+            args.mini_splatting_preserve_primary,
         )
-        detail = "nonzero={} target={}".format(nonzero_count, target)
+        detail = (
+            "nonzero={} target={} preserve_primary={} primary={} "
+            "selected_primary={} selected_secondary={}"
+        ).format(
+            nonzero_count,
+            target,
+            args.mini_splatting_preserve_primary,
+            primary_count,
+            selected_primary,
+            selected_secondary,
+        )
     elif stage == "prune":
-        keep = _source_cdf_mask(
+        keep, keep_count, achieved_mass, threshold = _source_cdf_mask(
             importance, args.mini_splatting_second_keep_mass
         )
-        detail = "keep_mass={:.6f}".format(args.mini_splatting_second_keep_mass)
+        detail = (
+            "keep_mass={:.6f} achieved_mass={:.8f} cdf_keep_count={} "
+            "threshold={:.8e}"
+        ).format(
+            args.mini_splatting_second_keep_mass,
+            achieved_mass,
+            keep_count,
+            threshold,
+        )
     else:
         raise ValueError("Unknown Mini-Splatting stage: {}".format(stage))
 
     gaussians.prune_points(~keep)
+    reinitialized = False
     if stage == "sample":
-        global_dist2 = _global_knn_dist2(gaussians.get_xyz.detach())
-        gaussians.reinitialize_after_mini_splatting(global_dist2)
+        if not args.mini_splatting_skip_sample_reinitialization:
+            global_dist2 = _global_knn_dist2(gaussians.get_xyz.detach())
+            gaussians.reinitialize_after_mini_splatting(global_dist2)
+            reinitialized = True
         train_dataset.cur_epoch_cameras = []
-    gaussians.training_setup(opt_args)
+    if reinitialized or not args.mini_splatting_preserve_optimizer_state:
+        gaussians.training_setup(opt_args)
+    else:
+        _reset_pruning_accumulators(gaussians)
     gaussians.redistribute_gaussians()
     gaussians.reset_blur_split_stats()
     _reset_strategy_history(strategy_history)
@@ -888,10 +1460,26 @@ def run_mini_splatting_pruning(
         background,
         strategy_history,
     )
+    _set_post_prune_learning_rates(
+        gaussians, opt_args, args.mini_splatting_post_prune_lr_scale
+    )
 
     after = _global_count(gaussians.get_xyz.shape[0])
     if args.mini_splatting_tile_budget > 0:
         detail += " tile_removed={}".format(tile_removed)
+    detail += " secondary_weight={:.6f}".format(
+        args.mini_splatting_secondary_weight
+    )
+    detail += " optimizer_state_preserved={}".format(
+        args.mini_splatting_preserve_optimizer_state and not reinitialized
+    )
+    detail += " post_prune_lr_scale={:.6f}".format(
+        args.mini_splatting_post_prune_lr_scale
+    )
+    if stage == "sample":
+        detail += " reinitialized={}".format(
+            not args.mini_splatting_skip_sample_reinitialization
+        )
     message = (
         "Mini-Splatting {} at iteration {}: views={} before={} after={} {}\n".format(
             stage,

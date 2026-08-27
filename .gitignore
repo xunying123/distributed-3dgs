@@ -13,6 +13,12 @@ old_files
 *.txt
 *.log
 *.out
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+checkpoint/
+checkpoints/
 __pycache__
 *.npy
 scripts/

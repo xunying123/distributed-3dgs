@@ -949,9 +949,18 @@ def start_strategy_final(batched_cameras, strategy_history):
                 division_pos[i] = (
                     division_pos[i] // n_tiles_per_image * n_tiles_per_image
                 )
-        for i in range(0, len(division_pos) - 1):
-            assert (
+        valid_division = all(
+            division_pos[i] + args.border_divpos_coeff < division_pos[i + 1]
+            for i in range(len(division_pos) - 1)
+        )
+        if not valid_division:
+            division_pos = [
+                total_tiles * gpu_id // world_size
+                for gpu_id in range(world_size + 1)
+            ]
+            assert all(
                 division_pos[i] + args.border_divpos_coeff < division_pos[i + 1]
+                for i in range(len(division_pos) - 1)
             ), "Each part between division_pos must be large enough."
 
         batched_strategies = []

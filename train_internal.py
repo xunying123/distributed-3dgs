@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import json
 from utils.loss_utils import l1_loss
@@ -56,6 +57,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if args.start_checkpoint != "":
             model_params, start_from_this_iteration = utils.load_checkpoint(args)
             gaussians.restore(model_params, opt_args)
+            if args.resume_xyz_lr_scale > 0.0:
+                gaussians.post_prune_xyz_lr_scale = args.resume_xyz_lr_scale
+                resume_scale_message = (
+                    "Applied resumed xyz LR scale: {:.6f}\n".format(
+                        args.resume_xyz_lr_scale
+                    )
+                )
+                utils.print_rank_0(resume_scale_message.rstrip())
+                log_file.write(resume_scale_message)
             utils.print_rank_0(
                 "Restored from checkpoint: {}".format(args.start_checkpoint)
             )
@@ -97,6 +107,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     )
     progress_bar.update(start_from_this_iteration - 1)
     num_trained_batches = 0
+    benchmark_started_at = None
+    local_benchmark_seconds = None
+    benchmark_iterations = 0
 
     ema_loss_for_log = 0
     nsight_profile_started = False
@@ -104,6 +117,29 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     for iteration in range(
         start_from_this_iteration, opt_args.iterations + 1, args.bsz
     ):
+        if (
+            benchmark_started_at is not None
+            and local_benchmark_seconds is None
+            and args.benchmark_until_iteration >= 0
+            and iteration >= args.benchmark_until_iteration
+        ):
+            torch.cuda.synchronize()
+            local_benchmark_seconds = time.perf_counter() - benchmark_started_at
+        if (
+            args.benchmark_from_iteration >= 0
+            and iteration >= args.benchmark_from_iteration
+            and benchmark_started_at is None
+            and local_benchmark_seconds is None
+            and (
+                args.benchmark_until_iteration < 0
+                or iteration < args.benchmark_until_iteration
+            )
+        ):
+            torch.cuda.synchronize()
+            benchmark_started_at = time.perf_counter()
+        if benchmark_started_at is not None and local_benchmark_seconds is None:
+            benchmark_iterations += args.bsz
+
         # Step Initialization
         if iteration // args.bsz % 30 == 0:
             progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
@@ -345,7 +381,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             strategy_history,
                         )
                         completed_mini_splatting_stages.add(stage)
-                        mini_splatting_pruned_this_iteration = True
+                        if not args.mini_splatting_diagnostic_only:
+                            mini_splatting_pruned_this_iteration = True
 
             # Save Gaussians
             if any(
@@ -447,6 +484,37 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         torch.cuda.synchronize()
         torch.cuda.cudart().cudaProfilerStop()
 
+    if benchmark_started_at is not None:
+        if local_benchmark_seconds is None:
+            torch.cuda.synchronize()
+            local_benchmark_seconds = time.perf_counter() - benchmark_started_at
+        benchmark_seconds = torch.tensor(
+            local_benchmark_seconds, dtype=torch.float64, device="cuda"
+        )
+        if utils.DEFAULT_GROUP.size() > 1:
+            dist.all_reduce(
+                benchmark_seconds,
+                op=dist.ReduceOp.MAX,
+                group=utils.DEFAULT_GROUP,
+            )
+        benchmark_message = (
+            "steady_state_benchmark: start_iteration={} end_iteration={} "
+            "iterations={} max_rank_seconds={:.6f} throughput={:.6f} it/s\n"
+        ).format(
+            args.benchmark_from_iteration,
+            min(
+                opt_args.iterations,
+                args.benchmark_until_iteration - 1,
+            )
+            if args.benchmark_until_iteration >= 0
+            else opt_args.iterations,
+            benchmark_iterations,
+            benchmark_seconds.item(),
+            benchmark_iterations / benchmark_seconds.item(),
+        )
+        log_file.write(benchmark_message)
+        utils.print_rank_0(benchmark_message.rstrip())
+
     if opt_args.iterations not in args.save_iterations:
         end2end_timers.print_time(log_file, opt_args.iterations)
     log_file.write(
@@ -471,14 +539,15 @@ def training_report(
         testing_iterations.pop(0)
         utils.print_rank_0("\n[ITER {}] Start Testing".format(iteration))
 
-        validation_configs = (
+        validation_configs = [
             {"name": "test", "cameras": scene.getTestCameras(), "num_cameras": len(scene.getTestCameras())},
-            {
+        ]
+        if not args.skip_train_eval:
+            validation_configs.append({
                 "name": "train",
                 "cameras": scene.getTrainCameras(),
                 "num_cameras": max(len(scene.getTrainCameras()) // args.llffhold, args.bsz),
-            },
-        )
+            })
 
         # init workload division strategy
         for config in validation_configs:
