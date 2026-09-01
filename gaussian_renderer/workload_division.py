@@ -94,6 +94,78 @@ def division_pos_heuristic(heuristic, tile_num, world_size, right=False):
     return division_pos
 
 
+def _division_pos_is_valid(division_pos, border_divpos_coeff):
+    return all(
+        division_pos[i] + border_divpos_coeff < division_pos[i + 1]
+        for i in range(len(division_pos) - 1)
+    )
+
+
+def _adjust_final_division_pos(
+    heuristic_division_pos,
+    n_tiles_per_image,
+    total_tiles,
+    world_size,
+    border_divpos_coeff,
+):
+    """Keep heuristic boundaries valid while avoiding needless image splits."""
+    assert len(heuristic_division_pos) == world_size + 1
+    assert heuristic_division_pos[0] == 0
+    assert heuristic_division_pos[-1] == total_tiles
+
+    # First try the existing optimization: boundaries very close to the end
+    # of one image are snapped onto that image boundary.  This avoids an
+    # extra per-image kernel launch when it does not invalidate the partition.
+    snapped_division_pos = heuristic_division_pos.copy()
+    for i in range(1, len(snapped_division_pos) - 1):
+        remainder = snapped_division_pos[i] % n_tiles_per_image
+        if remainder + border_divpos_coeff >= n_tiles_per_image:
+            snapped_division_pos[i] = (
+                snapped_division_pos[i] // n_tiles_per_image + 1
+            ) * n_tiles_per_image
+        elif remainder - border_divpos_coeff <= 0:
+            snapped_division_pos[i] = (
+                snapped_division_pos[i] // n_tiles_per_image
+            ) * n_tiles_per_image
+
+    if _division_pos_is_valid(snapped_division_pos, border_divpos_coeff):
+        return snapped_division_pos
+
+    # Snapping is only an overhead optimization.  If it makes two partitions
+    # collide, retain the load-balanced heuristic result instead of replacing
+    # the whole assignment with a uniform tile-count split.
+    if _division_pos_is_valid(heuristic_division_pos, border_divpos_coeff):
+        return heuristic_division_pos
+
+    # A highly concentrated/quantized heuristic can itself produce duplicate
+    # boundaries.  Repair only those conflicts, keeping every boundary as
+    # close as possible to its heuristic target while reserving enough rows
+    # for the remaining ranks.
+    minimum_span = max(1, int(border_divpos_coeff) + 1)
+    assert total_tiles >= world_size * minimum_span, (
+        "There are not enough tile rows to assign each GPU the required "
+        f"minimum span: total_tiles={total_tiles}, world_size={world_size}, "
+        f"minimum_span={minimum_span}."
+    )
+
+    repaired_division_pos = [0]
+    for gpu_id in range(1, world_size):
+        lower_bound = repaired_division_pos[-1] + minimum_span
+        upper_bound = total_tiles - (world_size - gpu_id) * minimum_span
+        repaired_division_pos.append(
+            min(
+                max(heuristic_division_pos[gpu_id], lower_bound),
+                upper_bound,
+            )
+        )
+    repaired_division_pos.append(total_tiles)
+
+    assert _division_pos_is_valid(
+        repaired_division_pos, border_divpos_coeff
+    ), "Each part between division_pos must be large enough."
+    return repaired_division_pos
+
+
 def get_local_running_time_by_modes(stats_collector):
     args = utils.get_args()
     local_running_time = 0
@@ -935,33 +1007,13 @@ def start_strategy_final(batched_cameras, strategy_history):
         division_pos = division_pos_heuristic(
             catted_accum_heuristic, total_tiles, world_size, right=True
         )
-        # slightly adjust the division_pos to avoid redundant kernel launch overheads.
-        for i in range(1, len(division_pos) - 1):
-            if (
-                division_pos[i] % n_tiles_per_image + args.border_divpos_coeff
-                >= n_tiles_per_image
-            ):
-                division_pos[i] = (
-                    division_pos[i] // n_tiles_per_image * n_tiles_per_image
-                    + n_tiles_per_image
-                )
-            elif division_pos[i] % n_tiles_per_image - args.border_divpos_coeff <= 0:
-                division_pos[i] = (
-                    division_pos[i] // n_tiles_per_image * n_tiles_per_image
-                )
-        valid_division = all(
-            division_pos[i] + args.border_divpos_coeff < division_pos[i + 1]
-            for i in range(len(division_pos) - 1)
+        division_pos = _adjust_final_division_pos(
+            division_pos,
+            n_tiles_per_image,
+            total_tiles,
+            world_size,
+            args.border_divpos_coeff,
         )
-        if not valid_division:
-            division_pos = [
-                total_tiles * gpu_id // world_size
-                for gpu_id in range(world_size + 1)
-            ]
-            assert all(
-                division_pos[i] + args.border_divpos_coeff < division_pos[i + 1]
-                for i in range(len(division_pos) - 1)
-            ), "Each part between division_pos must be large enough."
 
         batched_strategies = []
         gpuid2tasks = [
