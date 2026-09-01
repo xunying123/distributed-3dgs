@@ -197,6 +197,7 @@ class DistributionParams(ParamGroup):
         )
         self.sync_grad_mode = "dense"  # "dense", "sparse", "fused_dense", "fused_sparse" gradient synchronization. Only use when gaussians_distribution is False.
         self.grad_normalization_mode = "none"  # "divide_by_visible_count", "square_multiply_by_visible_count", "multiply_by_visible_count", "none" gradient normalization mode.
+        self.enable_bitmask_sparse_backward = False
 
         # Dataset and Model save
         self.bsz = 1  # batch size.

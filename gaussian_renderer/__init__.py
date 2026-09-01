@@ -27,6 +27,7 @@ from gsplat import (
 from scene.gaussian_model import GaussianModel
 import utils.general_utils as utils
 import torch.distributed.nn.functional as dist_func
+from gaussian_renderer.bitmask_sparse_all_to_all import bitmask_sparse_all_to_all
 
 
 @contextmanager
@@ -41,31 +42,23 @@ def _nvtx_range(name):
         yield
 
 
-def _register_all_to_all_backward_nvtx(output_tensors, input_tensors, name):
-    input_tensors = [t for t in input_tensors if t.requires_grad]
-    output_tensors = [t for t in output_tensors if t.requires_grad]
-    if not input_tensors or not output_tensors or not torch.cuda.is_available():
-        return
-
-    state = {"active": False, "remaining": len(input_tensors)}
-
-    def start_backward_range(grad):
-        if not state["active"]:
-            torch.cuda.nvtx.range_push(name)
-            state["active"] = True
-        return grad
-
-    def stop_backward_range(grad):
-        if state["active"]:
-            state["remaining"] -= 1
-            if state["remaining"] == 0:
-                torch.cuda.nvtx.range_pop()
-        return grad
-
-    for tensor in output_tensors:
-        tensor.register_hook(start_backward_range)
-    for tensor in input_tensors:
-        tensor.register_hook(stop_backward_range)
+def _differentiable_all_to_all(
+    output_tensor_list, input_tensor_list, group, nvtx_name
+):
+    if utils.get_args().enable_bitmask_sparse_backward:
+        return bitmask_sparse_all_to_all(
+            output_tensor_list=output_tensor_list,
+            input_tensor_list=input_tensor_list,
+            group=group,
+            nvtx_name=nvtx_name,
+        )
+    return list(
+        dist_func.all_to_all(
+            output_tensor_list=output_tensor_list,
+            input_tensor_list=input_tensor_list,
+            group=group,
+        )
+    )
 
 
 def get_cuda_args(strategy, mode="train"):  # "test"
@@ -281,16 +274,13 @@ def all_to_all_communication(
 
         if use_function_version:
             with _nvtx_range(f"forward.{nvtx_name}"):
-                functional_outputs = dist_func.all_to_all(
+                functional_outputs = _differentiable_all_to_all(
                     output_tensor_list=tensor_from_rki,
                     input_tensor_list=tensor_to_rki,
                     group=utils.DEFAULT_GROUP,
-                )  # The function version could naturally enable communication during backward.
-            if functional_outputs is not None:
-                tensor_from_rki = list(functional_outputs)
-            _register_all_to_all_backward_nvtx(
-                tensor_from_rki, tensor_to_rki, f"backward.{nvtx_name}"
-            )
+                    nvtx_name=nvtx_name,
+                )
+            tensor_from_rki = list(functional_outputs)
         else:
             with _nvtx_range(f"forward.{nvtx_name}"):
                 torch.distributed.all_to_all(
@@ -635,10 +625,7 @@ def all_to_all_communication_final(
     batched_strategies,
     iteration=0,
 ):
-    r = utils.DEFAULT_GROUP.rank()
-    ws = utils.DEFAULT_GROUP.size()
     num_cameras = len(batched_rasterizers)
-    log_file = utils.get_log_file()
     # gpui_to_gpuj_camk_size
     # gpui_to_gpuj_camk_send_ids
 
@@ -701,25 +688,15 @@ def all_to_all_communication_final(
                     device="cuda",
                 )
             )
-        send_bytes = sum(_nbytes(t) for t in tensor_to_rki)
-        recv_bytes = sum(_nbytes(t) for t in tensor_from_rki)
-        send_entries = sum(int(t.shape[0]) for t in tensor_to_rki)
-        recv_entries = sum(int(t.shape[0]) for t in tensor_from_rki)
-
-        if (
-            use_function_version
-        ):  # FIXME: there is error if I use torch.distributed.nn.functional to replace dist_func here. So weird.
+        if use_function_version:
             with _nvtx_range(f"forward.{nvtx_name}"):
-                functional_outputs = dist_func.all_to_all(
+                functional_outputs = _differentiable_all_to_all(
                     output_tensor_list=tensor_from_rki,
                     input_tensor_list=tensor_to_rki,
                     group=utils.DEFAULT_GROUP,
-                )  # The function version could naturally enable communication during backward.
-            if functional_outputs is not None:
-                tensor_from_rki = list(functional_outputs)
-            _register_all_to_all_backward_nvtx(
-                tensor_from_rki, tensor_to_rki, f"backward.{nvtx_name}"
-            )
+                    nvtx_name=nvtx_name,
+                )
+            tensor_from_rki = list(functional_outputs)
         else:
             with _nvtx_range(f"forward.{nvtx_name}"):
                 torch.distributed.all_to_all(
@@ -743,9 +720,6 @@ def all_to_all_communication_final(
                     dim=0,
                 ).contiguous()
             )
-        if (iteration - 1) % 250 == 0:
-            log_file.write(f"[iter {iteration}] send={send_bytes/1e6:.2f}MB recv={recv_bytes/1e6:.2f}MB "f"send_entries={send_entries} recv_entries={recv_entries} \n")
-
         return tensors_per_camera
 
     # Merge means2D, rgb, conic_opacity into one functional all-to-all communication call.
@@ -766,12 +740,6 @@ def all_to_all_communication_final(
             ).contiguous()
         )
         
-    # if ((iteration - 1) % 500 == 0 and iteration > 20000):
-    #     external_recv = sum(gpui_to_gpuj_imgk_size[i][r][k] for i in range(ws) if i!=r for k in range(num_cameras))
-    #     external_send = sum(gpui_to_gpuj_imgk_size[r][j][k] for j in range(ws) if j!=r for k in range(num_cameras))
-    #     local_kept    = sum(gpui_to_gpuj_imgk_size[r][r][k] for k in range(num_cameras))
-    #     print(f"[iter {iteration}] [rank {r}] local_kept={local_kept} external_send={external_send} external_recv={external_recv}")
-
     batched_params_redistributed = one_all_to_all(
         batched_catted_screenspace_states,
         use_function_version=True,
@@ -898,20 +866,15 @@ def gsplat_all_to_all_communication_final(
                 )
             )
 
-        if (
-            use_function_version
-        ):  # FIXME: there is error if I use torch.distributed.nn.functional to replace dist_func here. So weird.
+        if use_function_version:
             with _nvtx_range(f"forward.{nvtx_name}"):
-                functional_outputs = dist_func.all_to_all(
+                functional_outputs = _differentiable_all_to_all(
                     output_tensor_list=tensor_from_rki,
                     input_tensor_list=tensor_to_rki,
                     group=utils.DEFAULT_GROUP,
-                )  # The function version could naturally enable communication during backward.
-            if functional_outputs is not None:
-                tensor_from_rki = list(functional_outputs)
-            _register_all_to_all_backward_nvtx(
-                tensor_from_rki, tensor_to_rki, f"backward.{nvtx_name}"
-            )
+                    nvtx_name=nvtx_name,
+                )
+            tensor_from_rki = list(functional_outputs)
         else:
             with _nvtx_range(f"forward.{nvtx_name}"):
                 torch.distributed.all_to_all(
@@ -1007,9 +970,6 @@ def gsplat_all_to_all_communication_final(
         batched_depths_redistributed,
         gpui_to_gpuj_imgk_size,
     )
-
-def _nbytes(t): 
-    return int(t.numel() * t.element_size())
 
 def distributed_preprocess3dgs_and_all2all_final(
     batched_viewpoint_cameras,
